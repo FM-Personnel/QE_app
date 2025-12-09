@@ -12,3 +12,4 @@ pdfplumber
 matplotlib
 unstructured==0.10.30
 PyPDF2==3.0.1
+pdf2image
