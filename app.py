@@ -9,18 +9,20 @@ import importlib.metadata
 import re
 import tempfile
 import uuid
+import base64
+import logging
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from typing import List, Optional, Union, Dict, Any, Literal, Set
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchText
+from typing import List, Optional, Union, Dict, Any, Literal, Set, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict
 from PyPDF2 import PdfReader
 from docx import Document
-from unstructured.partition.pdf import partition_pdf  # Optionnel, pour une extraction plus fine
-from unstructured.partition.docx import partition_docx
+from urllib.parse import urlparse, parse_qs
 
 try:
     import pdfplumber
@@ -84,18 +86,8 @@ def safe_parse_date(date_str: Optional[str]) -> datetime:
             continue
     return datetime.min
 
-# Clé numérique
-def sort_key(article_num: str):
-    """
-    Transforme un identifiant d'article (ex: 'D146-12-1') en tuple numérique
-    pour un tri correct.
-    """
-    if not article_num:
-        return ("",)
-    prefix = article_num[0]
-    parts = re.findall(r'\d+', article_num)
-    nums = [int(p) for p in parts]
-    return (prefix, *nums)
+# Masquer les messages de warning de pdfminer
+logging.getLogger("pdfminer").setLevel(logging.WARNING)
 
 # Charger l'historique au démarrage
 load_historique()
@@ -107,7 +99,7 @@ st.set_page_config(
     layout="wide"   # ← élargit toute la page
 )
 
-# Classe  CSS pour tous les messages de statut
+# --- Classe  CSS pour tous les messages de statut
 st.markdown("""
 <style>
     /* ===== STYLES GLOBAUX ===== */
@@ -190,7 +182,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. Chargement des variables d'environnement ---
+# --- Chargement des variables d'environnement ---
 load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
@@ -211,7 +203,7 @@ if not MISTRAL_API_KEY:
 print("QDRANT_URL:", QDRANT_URL)
 print("QDRANT_API_KEY (début):", QDRANT_API_KEY[:10], "...")
 
-# --- 3. Chargement du modèle ---
+# --- Chargement du modèle ---
 LOCAL_MODEL_PATH = "./models/camembert_finetuned_progressive"
 HUB_MODEL_PATH = "Whisler/camembert_finetuned_progressive"
 
@@ -234,7 +226,7 @@ def load_embedding_model():
 
 embedding_model = load_embedding_model()
 
-# --- 4. Connexion à Qdrant ---
+# --- Connexion à Qdrant ---
 try:
     qdrant_client = QdrantClient(
         url=QDRANT_URL,
@@ -249,7 +241,7 @@ except Exception as e:
     raise
 
 
-# --- 5. Modèles Pydantic ---
+# --- Modèles Pydantic ---
 
 # Modele Pydantic pour les articles juridiques
 class BaseLegislativeRef(BaseModel):
@@ -325,64 +317,114 @@ class ResponseDocument(BaseModel):
     # Score du retrieval
     score: Optional[float] = None
 
-
 #################################################################
-# -------------- 2. PRINCIPALES FONCTIONS -----------------------
+# -------------- 1. PRINCIPALES FONCTIONS -----------------------
 #################################################################
 
-# --- 2a. Fonctions d'upload, d'indexation et d'embedding
+# --- 1a. Fonctions d'upload, d'indexation et d'embedding
 
 # Fonction pour extraire le texte d'un document pdf
 def extract_text(pdf_path: str, max_pages: Optional[int] = None) -> str:
-    """Extrait le texte d'un PDF, avec gestion des erreurs et des pages vides (VOTRE FONCTION)."""
-    text = []
+    """
+    Extrait le texte d'un PDF avec plusieurs stratégies :
+    - pdfplumber pour le texte brut
+    - fallback OCR si une page est vide
+    - nettoyage des espaces et des sauts de ligne
+    """
+    text_chunks = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
             pages = pdf.pages[:max_pages] if max_pages else pdf.pages
-            for page in pages:
-                page_text = page.extract_text() or ""
-                if page_text.strip():  # Ignore les pages vides
-                    text.append(page_text)
+            for i, page in enumerate(pages, start=1):
+                try:
+                    # Extraction brute
+                    page_text = page.extract_text() or ""
+                    word_count = len(page_text.split()) if page_text else 0
+                    
+ #                    # Si vide, tenter une extraction par OCR (optionnel)
+ #                    if not page_text.strip():
+ #                        try:
+ #                            from pdf2image import convert_from_path
+ #                            import pytesseract
+ #                            images = convert_from_path(pdf_path, first_page=i, last_page=i)
+ #                            ocr_text = pytesseract.image_to_string(images[0], lang="fra")
+ #                            page_text = ocr_text
+ #                            st.write(f"Page {i} → OCR fallback → {len(page_text.split())} mots")
+ #                        except Exception as e:
+ #                            print(f"⚠️ OCR non disponible pour la page {i}: {e}")
+ #                            pass
+                    
+                    # Nettoyage basique
+                    page_text = re.sub(r"\s+", " ", page_text).strip()
+                    
+                    if page_text:
+                        text_chunks.append(page_text)
+                except Exception as e:
+                    print(f"⚠️ Erreur page {i}: {e}")
+                    continue
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'extraction du PDF: {e}")
+        print(f"❌ Erreur lors de l'ouverture du PDF: {e}")
         return ""
-    return "\n".join(text)
+    
+    raw_text = "\n\n".join(text_chunks).strip()
+    return raw_text
 
 # Fonction pour extraire le texte d'un document Word
-def extract_text_from_docx(file_path: str, use_unstructured: bool = False) -> str:
+def extract_text_from_docx(file_path: str) -> str:
     """Extrait le texte d'un fichier Word."""
-    if use_unstructured:
-        elements = partition_docx(file_path)
-        text = "\n\n".join([str(el) for el in elements])
-    else:
+    try:
         doc = Document(file_path)
         text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-    return text.strip()
+        return text.strip()
+    except Exception as e:
+        st.error(f"❌ Erreur lors de l'extraction du DOCX: {e}")
+        return ""
 
 # Fonction pour nettoyer les textes extraits
 def clean_text(text: str) -> str:
-    """Nettoie le texte en supprimant les lignes trop courtes, les numéros de page et les artefacts (VOTRE FONCTION AMÉLIORÉE)."""
+    """Nettoie le texte extrait d'un PDF administratif en préservant la structure et les données utiles."""
     lines = text.split('\n')
     cleaned_lines = []
+
     for line in lines:
         line = line.strip()
-        # Ignorer les lignes trop courtes ou purement numériques
-        if len(line) > 10 and not re.match(r'^\d+$', line.strip()):
-            cleaned_lines.append(line)
+
+        # Ignore les lignes vides ou presque vides
+        if not line:
+            continue
+
+        # Ignore les numéros de page isolés (ex: "Page 57" ou "57")
+        if re.match(r'^(?:Page\s*)?\d+\s*$', line, re.IGNORECASE):
+            continue
+
+        # Ignore les en-têtes/pieds de page répétitifs (ex: "PLFSS 2025 - Annexe 7")
+        if re.match(r'^(?:PLFSS\s*\d{4}\s*-\s*Annexe\s*\d+|ANNEXE\s*DÉPENSES\s*DE\s*LA\s*BRANCHE\s*.*|securite-sociale\.fr|Source\s*:?\s*.*|Génération\s*X-Book)$', line, re.IGNORECASE):
+            continue
+
+        # Ignore les lignes avec seulement des caractères spéciaux ou des tirets
+        if re.match(r'^[•○◘\-—~=]+$', line):
+            continue
+
+        # Conserve les lignes même courtes (titres, sous-titres, etc.)
+        cleaned_lines.append(line)
+
+    # Reconstitue le texte
     text = '\n'.join(cleaned_lines)
-    # Supprimer les espaces multiples et sauts de ligne redondants
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)  # Recolle les mots coupés
-    text = re.sub(r'\b\d{1,3}\b(?=\s|$|\.|\,)', '', text)  # Supprime les nombres isolés
-    text = re.sub(r'PLFSS\s*20\d{2}\s*-\s*Annexe\s*\d+', "", text, flags=re.IGNORECASE)
-    text = re.sub(r"Source\s*:.*?(?=\n|$)", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[•○◘]\s*|\bPage\s+\d+\b", "", text)
-    text = re.sub(r"\bhttps?://\S+|\[.*?\]", "", text)
-    return text.strip()
+
+    # Nettoyage global
+    text = re.sub(r'\s+', ' ', text)  # Espaces multiples
+    text = re.sub(r'(\w)\s+-\s+(\w)', r'\1\2', text)  # Mots coupés par tiret
+    text = re.sub(r'\bhttps?://\S+', '', text)  # URLs
+    text = re.sub(r'[•○◘]+|[-=~]{5,}', '', text)  # Artefacts visuels
+
+    # Nettoie les espaces résiduels
+    text = text.strip()
+
+    return text
 
 # Fonction de suppression du sommaire
 def remove_summary(text: str) -> str:
-    """Supprime le sommaire et les tables des matières (VOTRE FONCTION)."""
+    """Supprime le sommaire et les tables des matières."""
     cleaned = re.sub(
         r"(?i)(SOMMAIRE|TABLE DES MATIÈRES).*?(?=PARTIE\s+\d+|ANNEXE\s+\d+|Article\s+\d+|$)",
         "",
@@ -393,7 +435,7 @@ def remove_summary(text: str) -> str:
 
 # Fonction de pré-traitement des titres
 def preprocess_for_titles(text: str) -> str:
-    """Insère des sauts de ligne avant chaque titre (VOTRE FONCTION OPTIMISÉE)."""
+    """Insère des sauts de ligne avant chaque titre pour améliorer la segmentation."""
     sentences = re.split(r'(?<=[.!?])\s+', text)
     processed_text = []
     for sentence in sentences:
@@ -405,12 +447,15 @@ def preprocess_for_titles(text: str) -> str:
         else:
             processed_text.append(sentence)
     text = " ".join(processed_text)
+
+    # Ajout de sauts de ligne autour des titres
     title_patterns = [
         r"(Article\s*\d*\s*[-–]?)", r"(ANNEXE\s+\d+)", r"(PARTIE\s+\d+)",
         r"(Fiches?\s+d’?évaluation\s+préalable)", r"(\d+\.\s+)", r"([IVXLCDM]+\.\s+)"
     ]
     for pattern in title_patterns:
         text = re.sub(pattern, r"\n\1\n", text, flags=re.IGNORECASE)
+
     text = re.sub(r'\n\s*\n', '\n', text)
     return text.strip()
 
@@ -421,7 +466,7 @@ def detect_titles(line: str) -> bool:
     if not line:
         return False
     regex_patterns = [
-        r"^Article\s+\d+\s*[–—-]", r"^ANNEXE\s+\d+", r"^PARTIE\s+\d+",
+        r"^Article\s+\d+\s*[–—-]?", r"^ANNEXE\s+\d+", r"^PARTIE\s+\d+",
         r"^(TITRE|Chapitre|Section)\s+\d+", r"^[IVXLCDM]+\.\s+", r"^\d+(\.\d+)*\s+"
     ]
     if any(re.match(p, line, flags=re.IGNORECASE) for p in regex_patterns):
@@ -435,11 +480,12 @@ def detect_titles(line: str) -> bool:
 
 # Fonction de segmentation du texte
 def segment_text(text: str, max_words: int = 300, min_words: int = 50) -> List[Dict[str, str]]:
-    """Découpe le texte en segments avec titres (VOTRE FONCTION ADAPTÉE POUR QDRANT)."""
+    """Découpe le texte en segments avec titres pour Qdrant."""
     blocks = re.split(r'\n\n|\.\s+', text)
     segments = []
     current_title = "AUTRE"
     current_content = []
+
     for block in blocks:
         block = block.strip()
         if not block:
@@ -453,10 +499,12 @@ def segment_text(text: str, max_words: int = 300, min_words: int = 50) -> List[D
             current_title = block
         else:
             current_content.append(block)
+
     if current_content:
         seg_text = ' '.join(current_content)
         if len(seg_text.split()) >= min_words:
             segments.append({"title": current_title, "text": seg_text})
+
     return segments
 
 # Fonction pour préparer les chunks
@@ -465,7 +513,6 @@ def prepare_chunks_fixed(text: str, file_name: str, chunk_size=350, overlap=50) 
     Découpe le texte en chunks fixes (~350 mots ≈ 512 tokens) avec overlap,
     en conservant le dernier titre détecté comme métadonnée.
     """
-    import uuid
     words = text.split()
     chunks = []
     start = 0
@@ -487,64 +534,87 @@ def prepare_chunks_fixed(text: str, file_name: str, chunk_size=350, overlap=50) 
                 "text": chunk_text,
                 "metadata": {
                     "source": file_name,
-                    "section": current_title,  # dernier titre détecté
+                    "section": current_title,
                     "position": start,
                     "word_count": len(chunk_words),
                     "upload_date": datetime.now().isoformat()
                 }
             })
-        start += chunk_size - overlap  # avance avec recouvrement
+        start += chunk_size - overlap
 
     return chunks
 
-# Fonction pour l'upload et l'indexation
-def process_and_index_document(file_path: str, file_type: str, collection_name: str, progress_callback=None, **kwargs):
-    """Traite et indexe un document dans SA PROPRE COLLECTION avec suivi de progression et gestion des timeouts."""
+# Fonction pour l'upload et l'indexation avec logs détaillés
+def process_and_index_document(file_path: str, file_type: str, collection_name: str,
+                               qdrant_client=None, embedding_model=None,
+                               progress_callback=None):
+    """Traite et indexe un document dans SA PROPRE COLLECTION avec suivi de progression et logs détaillés."""
     try:
         # 1. Extraction du texte
-        if file_type == "pdf":
-            raw_text = extract_text(file_path)
-        else:
-            raw_text = extract_text_from_docx(file_path)
+        try:
+            if file_type == "pdf":
+                raw_text = extract_text(file_path)
+            else:
+                raw_text = extract_text_from_docx(file_path)
 
-        if not raw_text:
+            if not raw_text:
+                if progress_callback:
+                    progress_callback(0, 100, "Échec : extraction du texte")
+                return False
+
             if progress_callback:
-                progress_callback(0, 1, "Échec : extraction du texte")
+                progress_callback(5, 100, "Extraction du texte terminée")
+
+        except Exception as e:
+            st.error(f"❌ Erreur extraction: {repr(e)}")
             return False
 
-        if progress_callback:
-            progress_callback(5, 100, "Extraction du texte terminée")
-
         # 2. Nettoyage et segmentation
-        cleaned_text = clean_text(raw_text)
-        segments = segment_text(cleaned_text) or [{"title": "Document", "text": cleaned_text}]
+        try:
+            cleaned_text = clean_text(raw_text)
 
-        if progress_callback:
-            progress_callback(10, 100, "Nettoyage et segmentation terminés")
+            segments = segment_text(cleaned_text) or [{"title": "Document", "text": cleaned_text}]
 
-        # 3. Préparation des chunks fixes avec overlap
-        preprocessed_text = preprocess_for_titles(cleaned_text)
-        chunks = prepare_chunks_fixed(
-            preprocessed_text,
-            file_name=collection_name,
-            chunk_size=350,   # ≈ 512 tokens
-            overlap=50        # recouvrement pour ne pas perdre de contexte
-        )
+            if progress_callback:
+                progress_callback(10, 100, "Nettoyage et segmentation terminés")
+        except Exception as e:
+            st.error(f"❌ Erreur nettoyage/segmentation: {repr(e)}")
+            return False
+
+        # 3. Pré-traitement titres
+        try:
+            preprocessed_text = preprocess_for_titles(cleaned_text)
+        except Exception as e:
+            st.error(f"❌ Erreur preprocess_for_titles: {repr(e)}")
+            return False        
+
+        # 4. Chunking
+        try:
+            chunks = prepare_chunks_fixed(
+                preprocessed_text,
+                file_name=collection_name,
+                chunk_size=350,   # ≈ 512 tokens
+                overlap=50
+            )
+        except Exception as e:
+            st.error(f"❌ Erreur chunking: {repr(e)}")
+            return False
 
         if progress_callback:
             progress_callback(30, 100, f"Préparation des chunks terminée ({len(chunks)} chunks)")
 
-        # 4. Génération des embeddings (par petits lots)
+        # 5. Génération des embeddings (par petits lots)
         texts = [chunk["text"] for chunk in chunks]
-        total_chunks = len(chunks)
         embeddings = []
+        total_chunks = len(chunks)
 
-        for i in range(0, len(texts), 5):  # Réduit à 5 chunks par lot pour éviter la surcharge
+        for i in range(0, total_chunks, 5):
             batch_texts = texts[i:i+5]
             try:
                 batch_embeddings = embedding_model.encode(batch_texts).tolist()
                 embeddings.extend(batch_embeddings)
             except Exception as e:
+                st.error(f"❌ Erreur génération embeddings: {repr(e)}")
                 if progress_callback:
                     progress_callback(0, 100, f"Erreur génération embeddings: {str(e)}")
                 return False
@@ -552,49 +622,31 @@ def process_and_index_document(file_path: str, file_type: str, collection_name: 
             if progress_callback:
                 current_chunk = min(i + 5, total_chunks)
                 progress_callback(30 + int(30 * current_chunk / total_chunks),
-                                100,
-                                f"Génération des embeddings : {current_chunk}/{total_chunks}")
+                                  100,
+                                  f"Génération des embeddings : {current_chunk}/{total_chunks}")
 
-        # 5. Indexation dans Qdrant (par petits lots avec réessais)
-        points = []
-        for chunk, embedding in zip(chunks, embeddings):
-            points.append(
-                models.PointStruct(
-                    id=chunk["id"],
-                    vector=embedding,
-                    payload={
-                        "text": chunk["text"],   # ← ajoute le texte du chunk
-                        **chunk["metadata"]      # ← conserve les métadonnées
-                    }
-                )
+        # 6. Indexation dans Qdrant (par petits lots avec réessais)
+        points = [
+            models.PointStruct(
+                id=chunk["id"],
+                vector=embedding,
+                payload={"text": chunk["text"], **chunk["metadata"]}
             )
-            
-        # Réduit la taille des batches et réessais
-        batch_size = 10  # Réduit de 50 à 10
-        max_retries = 2   # Nombre maximal de réessais
-        retry_delay = 2   # Délai entre les réessais en secondes
+            for chunk, embedding in zip(chunks, embeddings)
+        ]
+
+        batch_size = 10
+        max_retries = 2
+        retry_delay = 2
 
         for i in range(0, len(points), batch_size):
             batch = points[i:i + batch_size]
-            retry_count = 0
             success = False
-
-            for i in range(0, len(points), batch_size):
-                batch = points[i:i+batch_size]
-                try:
-                    qdrant_client.upsert(
-                        collection_name=collection_name,
-                        points=batch,
-                        wait=True,
-                    )
-                except Exception as e:
-                    st.error(f"Erreur Qdrant batch {i//batch_size+1}: {e}")
-                    st.write("Exemple point:", batch[0].vector[:10], "dim=", len(batch[0].vector))
-                    return False
+            retry_count = 0
 
             while retry_count < max_retries and not success:
                 try:
-                    kwargs["qdrant_client"].upsert(
+                    qdrant_client.upsert(
                         collection_name=collection_name,
                         points=batch,
                         wait=True,
@@ -602,10 +654,12 @@ def process_and_index_document(file_path: str, file_type: str, collection_name: 
                     success = True
                 except Exception as e:
                     retry_count += 1
+                    st.error(f"⚠️ Erreur upsert batch {i//batch_size+1}: {repr(e)}")
                     if progress_callback:
-                        progress_callback(0, 100, f"Échec batch {i//batch_size + 1}, tentative {retry_count}/{max_retries}")
+                        progress_callback(0, 100,
+                                          f"Échec batch {i//batch_size + 1}, tentative {retry_count}/{max_retries}")
                     if retry_count < max_retries:
-                        time.sleep(retry_delay)  # Attend avant de réessayer
+                        time.sleep(retry_delay)
 
             if not success:
                 if progress_callback:
@@ -615,11 +669,12 @@ def process_and_index_document(file_path: str, file_type: str, collection_name: 
             if progress_callback:
                 current_point = min(i + batch_size, len(points))
                 progress_callback(60 + int(40 * current_point / len(points)),
-                                100,
-                                f"Indexation : {current_point}/{len(points)} chunks")
+                                  100,
+                                  f"Indexation : {current_point}/{len(points)} chunks")
 
         if progress_callback:
             progress_callback(100, 100, "Indexation terminée avec succès")
+        st.success("🎉 Document indexé avec succès")
         return True
 
     except Exception as e:
@@ -628,7 +683,7 @@ def process_and_index_document(file_path: str, file_type: str, collection_name: 
         st.error(f"Erreur dans process_and_index_document: {e}")
         return False
 
-# --- 2b. Fonctions de recherche ---
+# --- 1b. Fonctions de recherche ---
 
 # Fonction qui supprime les accents
 def normalize_query(query: str) -> str:
@@ -901,6 +956,11 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 
     # Résultats de recherche (si présents)
     search_results = response_data.get("search_results", [])
+    search_summary = response_data.get("search_context") or response_data.get("answer")
+    if search_summary:
+        lines.append("🌐 Résumé de la recherche internet\n")
+        lines.append(str(search_summary))
+        lines.append("\n\n")
     if search_results:
         lines.append("🌐 Résultats de recherche\n")
         for idx, item in enumerate(search_results, start=1):
@@ -925,72 +985,33 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
         lines.append(f"  Question: {doc.question}\n")
         lines.append(f"  Réponse: {doc.reponse}\n\n")
 
-    # Articles juridiques (pour les deux modes)
+    # Articles juridiques
     if mode == "analyse" or include_legal_articles:
         lines.append("⚖️ Articles juridiques\n")
 
-        # Mode "Analyse juridique" : utilise "sources" (avec relations parents/enfants)
-        if mode == "analyse":
-            sources = response_data.get("sources", [])
-            if not sources:
-                lines.append("Aucun article juridique enregistré.\n")
-            else:
-                for source in sources:
-                    art = source["article"]
-                    lines.append(f"--- Article {art.num} ({art.collection}) ---\n")
-                    lines.append(f"Titre: {art.titre}\n")
-                    lines.append(f"Texte: {art.article_complet}\n")
-
-                    # Relations parents (articles cités)
-                    if source.get("parents"):
-                        lines.append("Articles cités:\n")
-                        for parent in source["parents"]:
-                            lines.append(f"- {parent.num}: {parent.titre}\n")
-
-                    # Relations enfants (référencé par)
-                    if source.get("enfants"):
-                        lines.append("Référencé par:\n")
-                        for enfant in source["enfants"]:
-                            lines.append(f"- {enfant.num}: {enfant.titre}\n")
-                    lines.append("\n")
-
-        # Mode "Réponse parlementaire" : utilise "legal_sources" (sans relations)
+        sources = response_data.get("sources", [])
+        if not sources:
+            lines.append("Aucun article juridique enregistré.\n")
         else:
-            legal_sources = response_data.get("legal_sources", [])
-            if not legal_sources:
-                lines.append("Aucun texte juridique cité.\n")
-            else:
-                for art in legal_sources:
-                    lines.append(f"- Article {getattr(art, 'num', 'N/A')} ({getattr(art, 'collection', 'N/A')})\n")
-                    if getattr(art, "titre", None):
-                        lines.append(f"  Titre: {art.titre}\n")
-                    contenu = art.article_complet if hasattr(art, 'article_complet') else getattr(art, 'contenu', '')
-                    lines.append("  Texte:\n" + str(contenu) + "\n\n")
+            for art in sources:
+                lines.append(f"--- Article {art.get('num','N/A')} ({art.get('collection','N/A')}) ---\n")
+                lines.append(f"Titre: {art.get('titre','')}\n")
+                lines.append(f"Texte: {art.get('contenu','')}\n")
+
+                # Relations parents (articles cités)
+                if art.get("parents"):
+                    lines.append("Articles cités:\n")
+                    for parent in art["parents"]:
+                        lines.append(f"- {parent.get('num','N/A')}: {parent.get('titre','')}\n")
+
+                # Relations enfants (référencé par)
+                if art.get("enfants"):
+                    lines.append("Référencé par:\n")
+                    for enfant in art["enfants"]:
+                        lines.append(f"- {enfant.get('num','N/A')}: {enfant.get('titre','')}\n")
+                lines.append("\n")
 
     return "\n".join(str(x) for x in lines)
-
-# Fonction qui construit un objet RetrievedLegalDocument à partir d'un payload Qdrant
-def make_retrieved_document(payload: dict, uid: str, collection: str, score: float = 0) -> RetrievedLegalDocument:
-    """Construit un objet RetrievedLegalDocument à partir d'un payload Qdrant."""
-    return RetrievedLegalDocument(
-        chunk_id=uid,
-        num=payload.get("num", ""),
-        titre=payload.get("titre", ""),
-        contenu=payload.get("contenu", ""),
-        article_complet=payload.get("article_complet", payload.get("contenu", "")),
-        contexte_hierarchique=payload.get("contexte_hierarchique", ""),
-        collection=collection,
-        partie=payload.get("partie"),
-        livre=payload.get("livre"),
-        titre_structure=payload.get("titre_structure"),
-        chapitre=payload.get("chapitre"),
-        section=payload.get("section"),
-        sous_section=payload.get("sous_section"),
-        paragraphe=payload.get("paragraphe"),
-        sous_paragraphe=payload.get("sous_paragraphe"),
-        base_legislative=payload.get("base_legislative", []),
-        score=score
-    )
 
 # Fonction qui recherche des articles juridiques dans les collections Qdrant en utilisant des embeddings
 def search_articles(
@@ -1001,7 +1022,8 @@ def search_articles(
     debug: bool = False,
     threshold: float = 0.0
 ) -> Dict[str, Any]:
-    """Recherche optimisée d'articles juridiques dans Qdrant."""
+    """Recherche optimisée d'articles juridiques dans Qdrant avec enrichissement (section + références)."""
+
     target_collections = ["CASF", "Code du travail", "Code de la santé publique", "Code de la sécurité sociale"]
     collections = qdrant_client.get_collections()
     valid_collections = [c.name for c in collections.collections if c.name in target_collections]
@@ -1010,11 +1032,17 @@ def search_articles(
         return {"sources": [], "total": 0, "limit": limit, "offset": 0}
 
     try:
-        # Recherche vectorielle
-        embedding = embedding_model.encode(query).tolist()
         query_filter = models.Filter(
             must=[models.FieldCondition(key="partie", match=models.MatchValue(value=partie))]
         ) if partie else None
+
+        # --- 1. Extraction des sous-questions ---
+        subqs = extract_subquestions(query)
+        if debug:
+            print("Sous-questions extraites :", subqs)
+
+        fused_query = " ".join(subqs) if subqs else query
+        embedding = embedding_model.encode(fused_query).tolist()
 
         all_results = []
         for collection in valid_collections:
@@ -1023,18 +1051,18 @@ def search_articles(
                     collection_name=collection,
                     query_vector=embedding,
                     query_filter=query_filter,
-                    limit=limit,
+                    limit=limit * 2,  # on prend plus large pour filtrer ensuite
                     with_payload=True,
                     with_vectors=False
                 )
                 all_results.extend(hits)
-            except Exception as e:
+            except Exception:
                 continue
 
-        # Filtrage par score
+        # --- 2. Filtrage par score ---
         results = [r for r in all_results if r.score >= threshold]
 
-        # Filtrage par mot-clé
+        # --- 3. Filtrage par mot-clé ---
         if must_contain:
             results = [
                 r for r in results
@@ -1044,207 +1072,330 @@ def search_articles(
         if not results:
             return {"sources": [], "total": 0, "limit": limit, "offset": 0}
 
-        # Mapping vers RetrievedLegalDocument
-        documents: List[RetrievedLegalDocument] = []
-        for result in results:
-            try:
-                # Utilise payload["chunk_id"] (str) au lieu de result.id (int/UUID)
-                chunk_id = result.payload.get("chunk_id")  # Ex: "L111-1_chunk0"
-                if not chunk_id:
-                    chunk_id = result.payload.get("uid", str(result.id))  # Fallback pour les collections sans chunk_id
-                article = make_retrieved_document(
-                    payload=result.payload,
-                    uid=chunk_id,  # ← Ici, chunk_id est TOUJOURS une chaîne
-                    collection=result.payload.get("collection", ""),
-                    score=result.score
-                )
-                documents.append(article)
-            except Exception as e:
-                continue
+        # --- 4. Normalisation en articles initiaux ---
+        initial_articles = normalize_chunks(results, provenance="initial")
 
-        # Déduplication par numéro
+        # --- 5. Déduplication + tri des initiaux ---
         seen = set()
-        unique_documents = []
-        for doc in documents:
-            if doc.num not in seen:
-                seen.add(doc.num)
-                unique_documents.append(doc)
+        unique_initials = []
+        for art in initial_articles:
+            if art["num"] not in seen:
+                seen.add(art["num"])
+                unique_initials.append(art)
 
-        # Tri par numéro
-        unique_documents.sort(key=lambda d: d.num)
+        # Tri par score ou numéro
+        unique_initials.sort(key=lambda d: d.get("score", 0), reverse=True)
+
+        # --- 6. Limitation des initiaux ---
+        limited_initials = unique_initials[:limit]
+
+        # --- 7. Enrichissements ---
+        context_articles = enrich_same_context(limited_initials, valid_collections)
+        referenced_articles = enrich_references(limited_initials, valid_collections)
+
+        # --- 8. Fusion + déduplication finale ---
+        all_articles = limited_initials + context_articles + referenced_articles
+        seen = set()
+        final_articles = []
+        for art in all_articles:
+            if art["num"] not in seen:
+                seen.add(art["num"])
+                final_articles.append(art)
+
+        # --- 9. Tri final ---
+        final_articles.sort(key=lambda d: d["num"])
 
         return {
-            "sources": unique_documents[:limit],
-            "total": len(unique_documents),
+            "sources": final_articles,
+            "total": len(final_articles),
             "limit": limit,
             "offset": 0
         }
 
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         return {"sources": [], "total": 0, "limit": limit, "offset": 0}
 
-# Fonction pour construire un arbre législatif
-def build_legislative_tree(sources: List[RetrievedLegalDocument]) -> Dict[str, Any]:
+# Fonction qui enrichit la liste des articles initiaux avec les articles de même niveau
+def enrich_same_context(initial_articles: list, collections: list, debug=True) -> list:
     """
-    Version corrigée qui:
-    1. Évite de modifier le dictionnaire pendant l'itération
-    2. Utilise une copie des clés pour l'itération
-    3. Conserve tous les logs et la structure uniforme
+    Version finale corrigée utilisant uniquement scroll avec des filtres
     """
+    enriched = []
 
-    # 1. Ajouter tous les articles sources (déjà des objets)
-    enrichis = {}
-    for art in sources:
-        enrichis[art.num] = {
-            "article": art,
-            "parents": [],
-            "enfants": [],
-            "type": art.num[0] if art.num else "?"
-        }
+    for art in initial_articles:
+        if debug:
+            print(f"\n🔹🔹🔹 Traitement de l'article {art.get('num', 'N/A')} 🔹🔹🔹")
+            print(f"Collection: {art.get('collection', 'N/A')}")
+            print(f"Contexte: {art.get('contexte_hierarchique', 'N/A')}")
 
-    # 2. Pour chaque article source, récupérer les articles de même groupe hiérarchique
-    for art in sources:
-        # Priorité des niveaux hiérarchiques (du plus précis au plus général)
-        hierarchy_levels = [
-            ("sous_paragraphe", art.sous_paragraphe),
-            ("paragraphe", art.paragraphe),
-            ("sous_section", art.sous_section),
-            ("section", art.section),
-            ("chapitre", art.chapitre)
-        ]
+        # Vérification des champs obligatoires
+        if not all(k in art and art[k] for k in ['num', 'collection', 'contexte_hierarchique']):
+            if debug:
+                print("❌ Champs obligatoires manquants")
+            continue
 
-        for level_key, level_value in hierarchy_levels:
-            if not level_value:
-                continue
-
-            try:
-                flt = models.Filter(
+        try:
+            # Utilisation de scroll avec filtre
+            result = qdrant_client.scroll(
+                collection_name=art['collection'],
+                scroll_filter=Filter(
                     must=[
-                        models.FieldCondition(
-                            key=level_key,
-                            match=models.MatchText(text=level_value)
-                        ),
-                        models.FieldCondition(
-                            key="collection",
-                            match=models.MatchValue(value=art.collection)
+                        FieldCondition(
+                            key="contexte_hierarchique",
+                            match=MatchValue(value=art['contexte_hierarchique'])
+                        )
+                    ],
+                    must_not=[
+                        FieldCondition(
+                            key="num",
+                            match=MatchValue(value=art["num"])
                         )
                     ]
-                )
+                ),
+                limit=50,
+                with_payload=True,
+                with_vectors=False
+            )
 
-                points, _ = qdrant_client.scroll(
-                    collection_name=art.collection,
-                    scroll_filter=flt,
-                    limit=100,
-                    with_payload=True,
-                    with_vectors=False,
-                )
+            points = result[0]  # La liste des points est le premier élément du tuple retourné
 
-                for point in points:
-                    payload = point.payload
-                    art_num = payload.get("num")
-                    if not art_num or art_num in enrichis:
-                        continue
+            if debug:
+                print(f"Résultats: {len(points)} articles trouvés")
+                for i, point in enumerate(points[:3]):  # Affiche les 3 premiers
+                    print(f"  {i+1}. {point.payload.get('num', 'N/A')}")
+                    print(f"     Titre: {point.payload.get('titre', 'N/A')}")
+                    print(f"     Contexte: {point.payload.get('contexte_hierarchique', 'N/A')}")
 
-                    new_art = make_retrieved_document(
-                        payload=payload,
-                        uid=payload.get("chunk_id", str(point.id)),
-                        collection=payload.get("collection", art.collection),
-                        score=0
-                    )
-                    enrichis[art_num] = {
-                        "article": new_art,
-                        "parents": [],
-                        "enfants": [],
-                        "type": art_num[0] if art_num else "?"
-                    }
+            enriched.extend(normalize_chunks(points, provenance="context"))
 
-                break
+        except Exception as e:
+            if debug:
+                print(f"❌ Erreur: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            continue
 
-            except Exception as e:
+    if debug:
+        print(f"\n📌 Résumé:")
+        print(f"  Articles initiaux: {len(initial_articles)}")
+        print(f"  Articles enrichis: {len(enriched)}")
+        if enriched:
+            print(f"  Numéros: {[a.get('num') for a in enriched[:5]]}")
+        else:
+            print("  Aucun article enrichi trouvé")
+
+    return enriched
+
+# Fonction pour enrichir la liste des articles avec les articles référencés
+def enrich_references(initial_articles: list, collections: list, debug=True) -> list:
+    """
+    Version finale corrigée pour les références
+    """
+    enriched = []
+
+    for art in initial_articles:
+        if debug:
+            print(f"\n🔗🔗🔗 Traitement des références pour {art.get('num', 'N/A')} 🔗🔗🔗")
+
+        if 'base_legislative' not in art or not art.get('base_legislative'):
+            if debug:
+                print("⚠️ Pas de base_legislative")
+            continue
+
+        if debug:
+            print(f"Base législative: {art['base_legislative']}")
+
+        for ref in art['base_legislative']:
+            ref_num = ref.get('uid')
+            ref_collection = ref.get('collection', art['collection'])
+
+            if not ref_num:
+                if debug:
+                    print(f"⚠️ UID manquant dans {ref}")
                 continue
 
-    # 3. Gestion des références (base_legislative) pour TOUS les articles
-    # ✅ Solution: Itérer sur une COPIE des clés pour éviter de modifier le dict pendant l'itération
-    for art_uid in list(enrichis.keys()):  # ← COPIE des clés !
-        art_data = enrichis[art_uid]
-        art = art_data["article"]
-
-        for ref in art.base_legislative or []:
-            ref_uid = ref.uid if hasattr(ref, 'uid') else ref.get('uid')
-            if not ref_uid or ref_uid in enrichis:
-                continue
+            if debug:
+                print(f"Recherche de {ref_num} dans {ref_collection}")
 
             try:
-                ref_collection = ref.collection if hasattr(ref, 'collection') else art.collection
-
-                ref_points, _ = qdrant_client.scroll(
+                result = qdrant_client.scroll(
                     collection_name=ref_collection,
-                    scroll_filter=models.Filter(
-                        must=[models.FieldCondition(
-                            key="num",
-                            match=models.MatchValue(value=ref_uid)
-                        )]
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="num",
+                                match=MatchValue(value=ref_num)
+                            )
+                        ]
                     ),
                     limit=1,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vectors=False
                 )
 
-                if ref_points:
-                    ref_payload = ref_points[0].payload
-                    ref_art = make_retrieved_document(
-                        payload=ref_payload,
-                        uid=ref_payload.get("chunk_id", str(ref_points[0].id)),
-                        collection=ref_payload.get("collection", ref_collection),
-                        score=0
-                    )
-                    enrichis[ref_uid] = {  # ✅ Ajout d'un nouvel élément au dict
-                        "article": ref_art,
-                        "parents": [],
-                        "enfants": [],
-                        "type": ref_uid[0] if ref_uid else "?"
-                    }
+                points = result[0]
 
-                    # Ajout des relations parent/enfant
-                    art_data["parents"].append(enrichis[ref_uid]["article"])
-                    enrichis[ref_uid]["enfants"].append(art_data["article"])
+                if debug:
+                    if points:
+                        print(f"✅ Référence trouvée:")
+                        for point in points:
+                            print(f"    - {point.payload.get('num', 'N/A')}")
+                    else:
+                        print(f"❌ Référence {ref_num} non trouvée")
+
+                enriched.extend(normalize_chunks(points, provenance="reference"))
 
             except Exception as e:
+                if debug:
+                    print(f"❌ Erreur: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                 continue
 
-    return enrichis
+    if debug:
+        print(f"\n📌 Résumé des références:")
+        print(f"  Références trouvées: {len(enriched)}")
+        if enriched:
+            print(f"  Numéros: {[a.get('num') for a in enriched[:5]]}")
+        else:
+            print("  Aucune référence trouvée")
+
+    return enriched
+
+# Fonction qui transforme les chunks en une liste d’articles normalisés
+def normalize_chunks(hits: list, provenance: str) -> list:
+    """Normalise les résultats Qdrant en conservant TOUS les champs."""
+    return [{
+        **hit.payload,  # Conserve tous les champs du payload
+        "provenance": provenance,
+        "score": hit.score if hasattr(hit, 'score') else None
+    } for hit in hits]
+
+# Fonction pour construire un arbre législatif
+def build_legislative_tree(articles: list) -> dict:
+    """
+    Construit une arborescence législative à partir d'une liste d'articles normalisés (dicts).
+    Niveaux utilisés : collection > partie > livre > titre_structure > chapitre > section > sous_section > paragraphe > sous_paragraphe > _items
+    """
+    def g(art: dict, key: str, default: str = "") -> str:
+        # Accès sûr aux champs; tente aussi depuis 'payload' si présent
+        if key in art and art[key] not in (None, ""):
+            return art[key]
+        payload = art.get("payload", {})
+        val = payload.get(key)
+        return val if val not in (None, "") else default
+
+    def infer_partie_from_context(art: dict) -> str:
+        ctx = g(art, "contexte_hierarchique")
+        # Exemple de contexte: "Partie législative > Livre I : ... > Titre I : ..."
+        if ctx:
+            parts = [x.strip() for x in ctx.split(">")]
+            for p in parts:
+                if p.lower().startswith("partie"):
+                    return p
+        return g(art, "partie", "")
+
+    def article_type_code(num: str) -> str:
+        return num[0] if isinstance(num, str) and num else "?"
+
+    tree: dict = {}
+
+    for art in articles:
+        collection = g(art, "collection")
+        partie = infer_partie_from_context(art)
+        livre = g(art, "livre")
+        titre_structure = g(art, "titre_structure")
+        chapitre = g(art, "chapitre")
+        section = g(art, "section")
+        sous_section = g(art, "sous_section")
+        paragraphe = g(art, "paragraphe")
+        sous_paragraphe = g(art, "sous_paragraphe")
+        num = g(art, "num")
+        titre = g(art, "titre")
+
+        # Création des niveaux
+        tree.setdefault(collection or "Collection inconnue", {})
+        lvl1 = tree[collection or "Collection inconnue"]
+
+        lvl1.setdefault(partie or "Partie inconnue", {})
+        lvl2 = lvl1[partie or "Partie inconnue"]
+
+        lvl2.setdefault(livre or "Livre inconnu", {})
+        lvl3 = lvl2[livre or "Livre inconnu"]
+
+        lvl3.setdefault(titre_structure or "Titre structure inconnu", {})
+        lvl4 = lvl3[titre_structure or "Titre structure inconnu"]
+
+        lvl4.setdefault(chapitre or "Chapitre inconnu", {})
+        lvl5 = lvl4[chapitre or "Chapitre inconnu"]
+
+        lvl5.setdefault(section or "Section inconnue", {})
+        lvl6 = lvl5[section or "Section inconnue"]
+
+        lvl6.setdefault(sous_section or "Sous-section inconnue", {})
+        lvl7 = lvl6[sous_section or "Sous-section inconnue"]
+
+        lvl7.setdefault(paragraphe or "Paragraphe inconnu", {})
+        lvl8 = lvl7[paragraphe or "Paragraphe inconnu"]
+
+        lvl8.setdefault(sous_paragraphe or "Sous-paragraphe inconnu", {})
+        lvl9 = lvl8[sous_paragraphe or "Sous-paragraphe inconnu"]
+
+        # Liste des items (articles)
+        items = lvl9.setdefault("_items", [])
+
+        # Métadonnées optionnelles (ex: type code L/R/D…)
+        items.append({
+            "num": num,
+            "titre": titre,
+            "type": article_type_code(num),
+            "article": art  # garder l'article complet pour l'affichage détaillé
+        })
+
+    return tree
 
 # Fonction de tri des numéros
-def sort_key_num(article_data: Dict[str, Any]) -> tuple:
-    """Clé de tri pour les numéros d'article (ex: L241-3)."""
-    num = article_data["article"].num  # Accès direct à l'attribut Pydantic
-    m = re.match(r"[LRD](\d+)(?:-(\d+))?", num)
-    if m:
-        base = int(m.group(1))
-        suffix = int(m.group(2)) if m.group(2) else 0
-        return (base, suffix)
-    return (float("inf"), float("inf"))
+def sort_key_article(article_data: Union[Dict[str, Any], str]) -> Tuple:
+    """
+    Clé de tri pour les numéros d'article.
+    Gère les formats simples (L241-3) et complexes (D146-12-1).
+    Retourne un tuple utilisable pour trier naturellement.
+    """
+    # Si on reçoit directement une chaîne
+    if isinstance(article_data, str):
+        num = article_data
+    else:
+        num = article_data.get("article", {}).get("num", "")
+
+    if not isinstance(num, str) or not num:
+        return ("", float("inf"))
+
+    prefix = num[0]  # L, R, D...
+    parts = re.findall(r"\d+", num)
+    nums = [int(p) for p in parts] if parts else [float("inf")]
+
+    return (prefix, *nums)
 
 # Fonction qui ajoute un article dans l'arbre partagé selon les niveaux hiérarchiques
-def add_to_tree(tree: dict, article: RetrievedLegalDocument, item: dict):
+def add_to_tree(tree: dict, article: dict, item: dict):
     """
     Ajoute un article dans l'arbre hiérarchique avec ses relations.
-    - article: Objet RetrievedLegalDocument (pour la hiérarchie)
-    - item: Dictionnaire COMPLET avec parents/enfants (pour les relations)
+    - article: dict normalisé (avec clés collection, partie, livre, etc.)
+    - item: dict complet avec parents/enfants
     """
     # Construire la hiérarchie depuis les champs de l'article
     levels = [
-        article.collection,
-        article.partie,
-        article.livre,
-        article.titre_structure,
-        article.chapitre,
-        article.section,
-        article.sous_section,
-        article.paragraphe,
-        article.sous_paragraphe,
+        article.get("collection"),
+        article.get("partie"),
+        article.get("livre"),
+        article.get("titre_structure"),
+        article.get("chapitre"),
+        article.get("section"),
+        article.get("sous_section"),
+        article.get("paragraphe"),
+        article.get("sous_paragraphe"),
     ]
     # Filtrer les niveaux vides
     levels = [lvl for lvl in levels if lvl]
@@ -1260,9 +1411,8 @@ def add_to_tree(tree: dict, article: RetrievedLegalDocument, item: dict):
 # Fonction qui affiche récursivement l'arbre sous forme d'expanders
 def render_tree(container, node: dict, level: int = 0):
     """
-    Version simplifiée qui affiche :
-    1. Tous les articles dans une arborescence unique
-    2. Pour chaque article : uniquement "Référencé par" et "Articles cités"
+    Affiche récursivement l'arbre sous forme d'expanders.
+    Chaque article est un dict normalisé.
     """
     # Styles CSS
     container.markdown("""
@@ -1275,38 +1425,64 @@ def render_tree(container, node: dict, level: int = 0):
     </style>
     """, unsafe_allow_html=True)
 
-    # Affichage des articles avec tri numérique
-    for data in sorted(node.get("_items", []),
-                      key=lambda x: [
-                          int(part) if part.isdigit() else part
-                          for part in x["article"].num.split('-')
-                      ]):
+    # Affichage des articles avec tri basé sur sort_key_article
+    for data in sorted(node.get("_items", []), key=sort_key_article):
         art = data["article"]
 
-        with container.expander(f"📜 {art.num} - {art.titre}"):
+        with container.expander(f"📜 {art.get('num','?')} - {art.get('titre','')}"):
             # Contenu de l'article
-            container.markdown(f'<div class="article-body">{art.article_complet}</div>', unsafe_allow_html=True)
+            container.markdown(
+                f'<div class="article-body">{art.get("contenu","")}</div>',
+                unsafe_allow_html=True
+            )
 
             # Section "Référencé par" (anciennement "Enfants")
             if data.get("enfants"):
-                container.markdown('<div class="relation-section">'
-                                   '<div class="relation-title">👶 Référencé par :</div>', unsafe_allow_html=True)
+                container.markdown(
+                    '<div class="relation-section"><div class="relation-title">👶 Référencé par :</div>',
+                    unsafe_allow_html=True
+                )
                 for enfant in data["enfants"]:
-                    container.markdown(f'<div class="relation-item">- {enfant.num} : {enfant.titre}</div>',
-                                      unsafe_allow_html=True)
+                    container.markdown(
+                        f'<div class="relation-item">- {enfant.get("num","?")} : {enfant.get("titre","")}</div>',
+                        unsafe_allow_html=True
+                    )
 
             # Section "Articles cités" (anciennement "Parents")
             if data.get("parents"):
-                container.markdown('<div class="relation-section">'
-                                   '<div class="relation-title">📚 Articles cités :</div>', unsafe_allow_html=True)
+                container.markdown(
+                    '<div class="relation-section"><div class="relation-title">📚 Articles cités :</div>',
+                    unsafe_allow_html=True
+                )
                 for parent in data["parents"]:
-                    container.markdown(f'<div class="relation-item">- {parent.num} : {parent.titre}</div>',
-                                      unsafe_allow_html=True)
+                    container.markdown(
+                        f'<div class="relation-item">- {parent.get("num","?")} : {parent.get("titre","")}</div>',
+                        unsafe_allow_html=True
+                    )
 
     # Navigation hiérarchique (uniquement pour l'organisation visuelle)
     for label, child in sorted(((k, v) for k, v in node.items() if k != "_items"), key=lambda x: x[0]):
         with container.expander(f"📁 {label}"):
             render_tree(container, child, level + 1)
+
+# Fonction pour afficher les articles de façon plate (pour Réponse parlementaire)
+def render_articles_flat(container, articles: list):
+    """
+    Affiche une liste plate d'articles normalisés (dicts) dans des expanders Streamlit.
+    Chaque article est un dict avec les clés : num, titre, contenu, collection, contexte_hierarchique, score, provenance.
+    """
+    if not articles:
+        container.info("Aucun texte juridique cité.")
+        return
+
+    for idx, art in enumerate(sorted(articles, key=lambda x: sort_key_article(x))):
+        score = art.get("score", "N/A")
+        label = f"{idx+1}. Article {art.get('num','?')} ({art.get('collection','N/A')}) - Score : {score}"
+
+        with container.expander(label):
+            container.markdown(f"**Titre :** {art.get('titre','')}")
+            container.markdown(f"**Contexte hiérarchique :** {art.get('contexte_hierarchique','')}")
+            container.markdown(f"**Texte complet :**\n\n{art.get('contenu','')}")
 
 # Fonction de recherches de documents dans tout le RAG (hors codes et jeu de données QE) pour alimenter l'API
 def search_uploaded_documents(
@@ -1314,7 +1490,7 @@ def search_uploaded_documents(
     qdrant_client: Any,
     embedding_model: Any,
     selected_collections: List[str] = None,
-    top_k: int = 3,
+    top_k: int = 5,
     top_k_selected = 10,
 ) -> List[Dict]:
     """
@@ -1384,7 +1560,7 @@ def search_uploaded_documents(
 def format_uploaded_docs_by_relevance(
     uploaded_results: List[Dict],
     min_score: float = 0.7,
-    max_docs: int = 3,
+    max_docs: int = 5,
     max_length: int = 400
 ) -> str:
     """
@@ -1488,28 +1664,59 @@ def extract_order(label: str) -> int:
         return int(m_num.group(1))
     return float("inf")
 
+# Fonction qui tri les articles pour que la limite de tokens des prompts s'applique intelligemment
+def sort_articles_for_prompt(articles: List[dict]) -> List[dict]:
+    """
+    Trie les articles pour le prompt en priorisant :
+    1. Les articles initiaux (provenance="initial") par score décroissant.
+    2. Les articles enrichis associés à chaque article initial, dans l'ordre des articles initiaux.
+    """
+    # 1. Séparer les articles initiaux et enrichis
+    initial_articles = [art for art in articles if art.get("provenance") == "initial"]
+    enriched_articles = [art for art in articles if art.get("provenance") != "initial"]
+
+    # 2. Trier les articles initiaux par score décroissant
+    initial_articles_sorted = sorted(
+        initial_articles,
+        key=lambda x: x.get("score", 0.0) if x.get("score") is not None else 0.0,
+        reverse=True
+    )
+
+    # 3. Ajouter les articles enrichis à la fin
+    sorted_articles = initial_articles_sorted + enriched_articles
+
+    return sorted_articles
+
 # Construit un prompt pour Mistral Large afin de générer une analyse juridique.
-def build_legal_analysis_prompt(question: str, articles: List[RetrievedLegalDocument], stats: dict) -> str:
-    # Construit un prompt pour Mistral Large afin de générer une analyse juridique.
-    # Préparation des articles sous forme de contexte avec troncature brute
-    max_chars = 70000  # limite totale pour les articles (≈ 3500-4000 tokens)
+def build_legal_analysis_prompt(question: str, articles: List[dict], stats: dict) -> str:
+    """
+    Construit un prompt pour Mistral Large afin de générer une analyse juridique.
+    Les articles sont des dicts normalisés avec les clés :
+    num, titre, contenu, contexte_hierarchique, collection, provenance, score.
+    """
+    max_tokens = 12000  # Limite pour Small/Medium (16k total - 4k pour la réponse)
     articles_context = []
-    total_chars = 0
+    total_tokens = 0
 
-    for article in articles:
-        uid = article.num
-        titre = article.titre
-        contenu = article.article_complet  # ou article.contenu selon votre besoin
+    # Utilisation directe de la liste d'articles déjà triée
+    for art in articles:
+        uid = art.get("num", "N/A")
+        titre = art.get("titre", f"Article {uid}")
+        contenu = art.get("contenu", "")
 
-        if total_chars + len(contenu) > max_chars:
-            # Tronquer le dernier article pour ne pas dépasser la limite
-            allowed = max_chars - total_chars
-            truncated = contenu[:allowed]
+        # Estimation des tokens pour cet article
+        article_text = f"### Article {uid}: {titre}\n{contenu}\n"
+        article_tokens = estimate_tokens(article_text)
+
+        if total_tokens + article_tokens > max_tokens:
+            # Tronquer le contenu pour rester dans la limite
+            allowed_tokens = max_tokens - total_tokens
+            truncated = truncate_text(contenu, max_tokens=allowed_tokens)
             articles_context.append(f"### Article {uid}: {titre}\n{truncated}\n[Texte tronqué]\n")
             break
         else:
-            articles_context.append(f"### Article {uid}: {titre}\n{contenu}\n")
-            total_chars += len(contenu)
+            articles_context.append(article_text)
+            total_tokens += article_tokens
 
     articles_str = "\n".join(articles_context)
 
@@ -1520,7 +1727,8 @@ def build_legal_analysis_prompt(question: str, articles: List[RetrievedLegalDocu
     1. **Structure obligatoire** à respecter impérativement :
        - Introduction (50-100 mots) : rappel du contexte juridique de la question
        - Analyse détaillée (80-90% du contenu) :
-         * L'analyse doit être faite exclusivement à partir des articles suivants : {articles_str}
+         * L'analyse doit être faite exclusivement à partir des articles suivants :
+         * {articles_str}
          * Présentation des principes généraux avec citations précises d'un maximum d'articles
          * Présentation des enjeux
        - Conclusion synthétique (100-150 mots)
@@ -1548,14 +1756,13 @@ def build_legal_analysis_prompt(question: str, articles: List[RetrievedLegalDocu
     """
     return prompt
 
-# Appelle l'API Mistral Large pour générer une analyse juridique ##### 4000 TOKENS DEFINIS ICI ######
+# Appelle l'API Mistral Large pour générer une analyse juridique
 def call_mistral_legal_analysis(
     prompt: str,
-    max_tokens: int = 4000,
+    max_tokens: int = 12000,  # Valeur par défaut pour Small/Medium
     temperature: float = 0.3,
     model_size: str = "small"  # "large", "medium", "small"
 ):
-    # Appelle l'API Mistral avec chainage automatique pour les réponses tronquées.
     mistral_api_url = "https://api.mistral.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
@@ -1565,14 +1772,22 @@ def call_mistral_legal_analysis(
     # Construire le nom du modèle dynamiquement
     model_name = f"mistral-{model_size}-latest"
 
+    # Ajustement automatique de max_tokens en fonction du modèle
+    if model_size == "large":
+        max_tokens = min(max_tokens, 28000)  # 32k - 4k (marge pour la réponse)
+    else:
+        max_tokens = min(max_tokens, 12000)  # 16k - 4k (marge pour la réponse)
+
+    # Vérification de la taille du prompt
+    prompt_tokens = estimate_tokens(prompt)
+    if prompt_tokens > 30000:  # Limite absolue pour Mistral Large
+        raise ValueError(f"Prompt trop long: {prompt_tokens} tokens (limite: 30000)")
+
     def is_complete(response_text):
-        # Vérifie si une réponse est grammaticalement complète
         if not response_text:
             return False
-
         last_char = response_text[-1]
         last_sentence = response_text.split('.')[-1].strip()
-
         return (
             (last_char in ('.', '!', '?')) and
             (len(last_sentence.split()) > 3) and
@@ -1581,11 +1796,10 @@ def call_mistral_legal_analysis(
         )
 
     def complete_response(truncated_response):
-        # Termine une réponse tronquée
         completion_prompt = f"""
         [INST]
         Terminez cette analyse juridique de manière complète et professionnelle.
-        Analyse en cours: "{truncated_response[-500:]}"  # Derniers 500 caractères
+        Analyse en cours: "{truncated_response[-500:]}"
 
         Consignes strictes:
         1. Résumez en 1 phrase le point juridique en cours
@@ -1596,28 +1810,21 @@ def call_mistral_legal_analysis(
         3. Utilisez un style formel: "En conséquence...", "Ainsi, il ressort que...", etc.
         [/INST]
         """
-
         try:
             completion_response = requests.post(
                 mistral_api_url,
                 headers=headers,
                 json={
-                    "model": model_name,  # <-- correction ici
+                    "model": model_name,
                     "messages": [{"role": "user", "content": completion_prompt}],
                     "max_tokens": 500,
                     "temperature": 0.2,
-                    "stop": ["."]  
                 },
                 timeout=30
             )
             completion_response.raise_for_status()
             completion = completion_response.json()["choices"][0]["message"]["content"].strip()
-
- #            if is_complete(completion):
             return truncated_response + "\n\n" + completion
- #            else:
- #                return truncated_response + "\n\nCette analyse couvre succinctement les principaux aspects juridiques de la question posée."
-
         except Exception as e:
             return truncated_response + f"\n\n[Note: La conclusion de cette analyse a été synthétisée. Erreur technique: {str(e)}]"
 
@@ -1626,7 +1833,7 @@ def call_mistral_legal_analysis(
             mistral_api_url,
             headers=headers,
             json={
-                "model": model_name,  # <-- correction ici aussi
+                "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -1658,13 +1865,17 @@ def generate_legal_analysis(
     search_button: bool = False,
     generate_analysis_button: bool = False
 ) -> dict:
+    """
+    Fonction de génération d'analyse juridique.
+    """
+    captured_output = None
     try:
         import sys
         from io import StringIO
         old_stdout = sys.stdout
         sys.stdout = captured_output = StringIO()
 
-        # Recherche des articles (avec cache)
+        # --- Étape 1 : Recherche des articles (avec cache) ---
         if "last_articles_search" not in st.session_state or search_button:
             st.session_state.last_articles_search = search_articles(
                 query=question,
@@ -1675,101 +1886,124 @@ def generate_legal_analysis(
             )
         articles = st.session_state.last_articles_search
 
-        # Préparation des sources enrichies
+        # --- Étape 2 : Construction de l'arbre législatif ---
         enrichis = build_legislative_tree(articles["sources"])
-        stats = enrichis.pop('stats', {})
+        stats = enrichis.pop('stats', {}) if isinstance(enrichis, dict) else {}
 
-        # Formatage des sources pour l'affichage et l'analyse
+        # --- Étape 3 : Formatage des sources pour l'affichage ---
         sources = []
         for uid, data in enrichis.items():
             if isinstance(data, dict) and "article" in data:
+                art = data["article"]
+                num = art.get("num")
+                type_code = num[0] if isinstance(num, str) and num else "?"
                 sources.append({
                     "uid": uid,
-                    "article": data["article"],
-                    "type": data.get("type"),
+                    "num": num,
+                    "titre": art.get("titre"),
+                    "contenu": art.get("contenu"),
+                    "collection": art.get("collection"),
+                    "contexte_hierarchique": art.get("contexte_hierarchique"),
+                    "provenance": art.get("provenance", "initial"),
+                    "type": type_code,
                     "parents": data.get("parents", []),
-                    "enfants": data.get("enfants", [])
+                    "enfants": data.get("enfants", []),
+                    "score": art.get("score")
                 })
 
-        # Fallback si aucun enrichissement
+        # --- Étape 4 : Fallback si aucun enrichissement ---
         if not sources:
-            sources = [{
-                "uid": art.num,
-                "article": art,
-                "type": art.num[0] if art.num else "?",
-                "parents": [],
-                "enfants": []
-            } for art in articles["sources"]]
+            sources = []
+            for art in articles["sources"]:
+                num = art.get("num")
+                type_code = num[0] if isinstance(num, str) and num else "?"
+                sources.append({
+                    "uid": num,
+                    "num": num,
+                    "titre": art.get("titre"),
+                    "contenu": art.get("contenu"),
+                    "collection": art.get("collection"),
+                    "contexte_hierarchique": art.get("contexte_hierarchique"),
+                    "provenance": art.get("provenance", "initial"),
+                    "type": type_code,
+                    "parents": [],
+                    "enfants": [],
+                    "score": art.get("score")
+                })
 
-        # Gestion des cas d'erreur
-        if not sources or len(sources) == 0:
+        # --- Étape 5 : Gestion des cas d'erreur ---
+        if not sources:
             st.warning("Aucun article juridique valide après traitement.")
             return {
                 "response": "Aucun article juridique valide après traitement.",
                 "sources": [],
                 "similar_documents": [],
-                "debug_logs": captured_output.getvalue(),
+                "debug_logs": captured_output.getvalue() if captured_output else "",
                 "stats": stats
             }
 
-        # Mode "Recherche" (affichage des articles)
+        # --- Étape 6 : Mode "Recherche" ---
         if search_button:
             return {
                 "response": "Voir les articles dans l'onglet sources.",
                 "sources": sources,
                 "similar_documents": [],
-                "debug_logs": captured_output.getvalue(),
+                "debug_logs": captured_output.getvalue() if captured_output else "",
                 "stats": stats
             }
 
-        # Mode "Génération" (appel à Mistral)
+        # --- Étape 7 : Mode "Génération" ---
         elif generate_analysis_button:
             prep_placeholder = st.empty()
-            prep_placeholder.markdown(
-                '''
-                <div class="prep-message">
-                    🔧 Production de l'analyse en cours<span id="dots">...</span>
-                </div>
-                <script>
-                    const dots = document.getElementById('dots');
-                    let dotCount = 0;
-                    const interval = setInterval(() => {
-                        dotCount = (dotCount + 1) % 4;
-                        dots.textContent = '.'.repeat(dotCount);
-                    }, 500);
-                </script>
-                ''',
-                unsafe_allow_html=True
+            prep_placeholder.markdown("🔧 Production de l'analyse en cours...", unsafe_allow_html=True)
+
+            # Tri des articles pour le prompt (sans modifier l'affichage)
+            articles_for_prompt = sort_articles_for_prompt(sources)
+
+            # Construction du prompt avec les articles triés
+            prompt = build_legal_analysis_prompt(
+                question,
+                articles_for_prompt,  # Liste triée pour le prompt
+                stats
             )
 
-            # Appel à Mistral avec les articles originaux (non enrichis)
-            prompt = build_legal_analysis_prompt(question, articles["sources"], stats)
+            # Ajustement de max_tokens selon le modèle
+            max_response_tokens = 28000 if model_size == "large" else 12000
+
             legal_analysis = call_mistral_legal_analysis(
                 prompt,
-                max_tokens=4000,
+                max_tokens=max_response_tokens,
                 temperature=0.3,
                 model_size=model_size
             )
 
-            # Efface le message de chargement
             prep_placeholder.empty()
 
             return {
                 "response": legal_analysis,
-                "sources": sources,  # Sources enrichies pour l'affichage
+                "sources": sources,  # Liste originale pour l'affichage
                 "similar_documents": [],
-                "debug_logs": captured_output.getvalue(),
+                "debug_logs": captured_output.getvalue() if captured_output else "",
                 "stats": stats
             }
 
+    except Exception as e:
+        return {
+            "response": f"Erreur lors de la génération de l'analyse juridique : {str(e)}",
+            "sources": [],
+            "similar_documents": [],
+            "debug_logs": captured_output.getvalue() if captured_output else "",
+            "stats": {}
+        }
     finally:
-        sys.stdout = old_stdout
+        if 'old_stdout' in locals():
+            sys.stdout = old_stdout
 
 # Construit le prompt d'appel à Mistral
 def build_parlementary_response_prompt(
     question: str,
     parliamentary_context: str,
-    legal_context: str,
+    legal_context: str,  # Chaîne de caractères déjà triée et tronquée
     uploaded_documents: str,
     detail_juridique: int,
     longueur: str,
@@ -1777,9 +2011,10 @@ def build_parlementary_response_prompt(
     custom_instructions: str,
     search_context: str
 ) -> str:
-    # Construit un prompt optimisé avec contexte parlementaire ET juridique.
+    """
+    Construit un prompt optimisé avec contexte parlementaire ET juridique.
+    """
     # Mapping des orientations de réponse
-
     orientation_mapping = {
         "Répondre de façon neutre":
             "Adoptez un ton neutre et factuel. "
@@ -1802,13 +2037,13 @@ def build_parlementary_response_prompt(
             "'Les marges de manœuvre sont encadrées par [contrainte légale/budgétaire], mais le Gouvernement agit dans le respect de ces règles pour [objectif].' "
             "4. **Mettez en avant les alternatives ou mesures en cours** : "
             "'Plutôt que [proposition du parlementaire], le Gouvernement a choisi de [mesure alternative], qui permet de [bénéfice].' "
-            "Exemple : 'Plutôt qu’une refonte complète du dispositif, nous avons renforcé [mesure X], qui a déjà permis [résultat].' "
+            "Exemple : 'Plutôt qu'une refonte complète du dispositif, nous avons renforcé [mesure X], qui a déjà permis [résultat].' "
             "Évitez les formulations défensives comme 'nous ne pouvons pas' – préférez 'notre approche privilégie [solution], car [raison].'",
 
         "Répondre positivement aux propositions du parlementaire":
-            "Saluiez l’intérêt de la proposition **sans reprendre les critiques sous-jacentes**. "
+            "Saluiez l'intérêt de la proposition **sans reprendre les critiques sous-jacentes**. "
             "Utilisez des formulations comme : "
-            "'Votre proposition s’inscrit dans une dynamique que le Gouvernement partage, comme en attestent [mesures existantes].' "
+            "'Votre proposition s'inscrit dans une dynamique que le Gouvernement partage, comme en attestent [mesures existantes].' "
             "'Nous partageons votre préoccupation pour [enjeu], et nos actions vont dans le sens de [objectif], comme le montre [exemple].' "
             "Évitez : 'Vous avez raison de souligner que...' → préférez : 'Votre attention à ce sujet rejoint nos priorités, illustrées par [action].'",
 
@@ -1818,7 +2053,7 @@ def build_parlementary_response_prompt(
             "1. **Cadre juridique** : 'Le dispositif actuel, défini par [article X], repose sur [principe].' "
             "2. **Données chiffrées** : 'Les derniers chiffres (source : [DREES/INSEE/...], [année]) montrent que [tendance].' "
             "3. **Mesures en cours** : 'Pour répondre à ces enjeux, [mesure A] et [mesure B] ont été mises en place, avec [résultat].' "
-            "Utilisez un vocabulaire neutre et des verbes d’action : 'le Gouvernement a engagé', 'les services travaillent à', 'les résultats montrent que'."
+            "Utilisez un vocabulaire neutre et des verbes d'action : 'le Gouvernement a engagé', 'les services travaillent à', 'les résultats montrent que'."
     }
 
     # Longueur maximale selon le paramètre
@@ -1851,17 +2086,25 @@ def build_parlementary_response_prompt(
        Citez explicitement les articles pertinents (ex: "comme le précise l'article L124-5 du CASF...").
 
     2. **Structure** :
-       - Reconnaître l'importance du sujet sans insister sur les difficultés soulevées par le parlementaire, surtout si elles sont critiques quant à l'action du Gouvernement
+       - Introduisez le sujet sans insister sur les difficultés soulevées par le parlementaire, surtout si elles sont critiques quant à l'action du Gouvernement
        - Rappelez éventuellement les chiffres et le cadre juridique
-       - Poursuivez avec les éléments budgetaires
+       - Poursuivez avec les éléments budgétaires, prioritairement ceux qui concernent l'année en cours
        - Intégrez les informations issues prioritairement des documents de référence uploadés puis de la recherche internet de manière fluide, sans mention explicite de la source ("recherche internet", "résultats de recherche") pour :
-            - décrire les mesures prises par le Gouvernement et celles sur lesquelles le Gouvernement travaille
-            - préciser la position du Gouvernement sur le sujet principal de la question parlementaire
-       - Ne pas annoncer d'échéances à venir pour des dates antérieures à la date du jour (exemple : "Une concertation sera menée d’ici l’été 2024" alors que nous sommes en novembre 2025)
+            - décrivez les mesures prises par le Gouvernement et celles sur lesquelles le Gouvernement travaille
+            - précisez la position du Gouvernement sur les questions posées par le parlementaire
+            - insistez sur les décisions et les actions du Gouvernement les plus récentes
+       - N'annoncez pas d'échéances à venir pour des dates antérieures à la date du jour (exemple à éviter : "Une concertation sera menée d’ici l’été 2024" alors que nous sommes en novembre 2025)
        - Concluez en réaffirmant l'engagement du Gouvernement.
-       - Ne pas mélanger le sujet à d'autres sujets trop éloignés dans la conclusion.
+       - Ne mélangez pas le sujet à d'autres sujets trop éloignés dans la conclusion.
 
-    3. **Niveau de détail** : {detail_juridique}/5 (adaptez la profondeur des explications juridiques).
+    3. **Niveau de détail juridique** :
+    Le niveau de détail juridique demandé est de {detail_juridique}/5.
+    Respectez strictement les consignes suivantes en fonction de ce niveau :
+    - **Niveau 1** : Aucune référence juridique n'est obligatoire.
+    - **Niveau 2** : Une seule phrase doit mentionner le cadre juridique général (ex: "Conformément au Code de la sécurité sociale, ...").
+    - **Niveau 3** : Un paragraphe court (2-3 phrases) doit expliquer le cadre juridique applicable, en citant un article clé si pertinent.
+    - **Niveau 4** : Un paragraphe détaillé (4-5 phrases) doit analyser les implications juridiques, en citant explicitement 2-3 articles ou principes juridiques.
+    - **Niveau 5** : Une analyse juridique complète (1-2 paragraphes) est requise, avec citations précises de tous les articles pertinents, leurs interactions, et leurs implications concrètes pour la question posée.
 
     4. **Longueur et ajustement dynamique** :
        - Limite absolue : {max_tokens} tokens.
@@ -1878,6 +2121,7 @@ def build_parlementary_response_prompt(
 
     6. **Style** :
        - Utilisez un style administratif, formel et concis, comme dans les réponses ministérielles.
+       - Soyez précis, évitez absolument les généralités.
        - La réponse doit être rédigée en prose continue, sans titres, sans puces, sans numérotation.
        - Répondez précisément aux questions posées, par exemple sur les éléments budgétaires ou de calendrier.
        - La réponse doit être d'actualité et privilégier les informations les plus récentes.
@@ -1898,35 +2142,28 @@ def build_parlementary_response_prompt(
     return prompt
 
 # Appelle l'API Mistral Large pour générer une réponse parlementaire
-def call_mistral_parlementary_response(
+def call_mistral_parliamentary_response(
     prompt: str,
     longueur: str,
     question: str,
     max_retries: int = 2,
-    model_size: str = "small"   # "large", "medium", "small"
+    model_size: str = "small"
 ) -> str:
-    # Appelle l'API Mistral pour générer une réponse parlementaire. Le modèle est choisi dynamiquement (small, medium, large).
     mistral_api_url = "https://api.mistral.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    # Construire le nom du modèle dynamiquement
     model_name = f"mistral-{model_size}-latest"
-
-    # Déterminer la taille de sortie en fonction de la longueur souhaitée
-    if longueur.startswith("Courte"):
-        max_tokens = 500
-    elif longueur.startswith("Moyenne"):
-        max_tokens = 1000
-    else:
-        max_tokens = 2200
+    max_tokens = 500 if longueur.startswith("Courte") else 1000 if longueur.startswith("Moyenne") else 2200
 
     # Vérifier la taille du prompt
     prompt_tokens = estimate_tokens(prompt)
-    if prompt_tokens > 30000:
-        raise ValueError(f"Prompt trop long: {prompt_tokens} tokens (limite: 30000)")
+    max_allowed_prompt_tokens = 32000 if model_size == "large" else 16000
+
+    if prompt_tokens > max_allowed_prompt_tokens:
+        raise ValueError(f"Prompt trop long: {prompt_tokens} tokens (limite: {max_allowed_prompt_tokens})")
 
     payload = {
         "model": model_name,
@@ -1953,7 +2190,7 @@ def call_mistral_parlementary_response(
             return mistral_response
 
         except requests.exceptions.HTTPError as e:
-            if response.status_code == 429 and attempt < max_retries - 1:  # Too Many Requests
+            if response.status_code == 429 and attempt < max_retries - 1:
                 st.warning(f"⏳ API Mistral temporairement encombrée. Tentative {attempt + 1}/{max_retries}. Relance dans 10 secondes...")
                 time.sleep(10)
             else:
@@ -2028,47 +2265,157 @@ def handle_truncated_response(response: str, question: str, longueur: str) -> st
         return response + " (réponse incomplète)"
 
 # --- 7. Génération de la réponse ---
+
+# Fonction qui identifie les sous-questions
+def extract_subquestions(question: str) -> list[str]:
+    """
+    Décompose une question parlementaire en sous-questions explicites ou implicites.
+    - Maximum 5 sous-questions
+    - Minimum: seulement celles qui sont pertinentes
+    - Chaque sous-question doit être formulée clairement
+    """
+    url = "https://api.mistral.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "mistral-small-latest",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Extrayez les grandes catégories de sous-questions (explicites et implicites) d'une question parlementaire en français. "
+                    "NE VOUS APPUYEZ PAS exclusivement sur les points d'interrogation. "
+                    "Repèrez les formulations comme: « souhaite savoir », « souhaite donc savoir », « demande », "
+                    "« interroge », « voudrait connaître », « comment », « quelles mesures », « envisage », "
+                    "« avec quels moyens », « de quelle manière », « clarifier ». "
+                    "Pour chaque sous-question ou catégorie de sous-questions : "
+                    "- Reformulez-la de manière claire et concise (une vingtaine de mots) en une phrase interrogative. "
+                    "- N'inventez rien : si tu n'identifies aucune sous-question, réponds « Aucune sous-question explicite ou implicite détectée. ». "
+                    "Développez systématiquement et dans toutes les sous-questions les acronymes en toutes lettres"
+                    "**Consigne stricte** : les sous-questions ne doivent pas être redondantes donc si la thématique est très proche il faut les regrouper. "
+                    "Format strict, jusqu'à 5 sous-questions ou groupes de sous-questions, maximum mais ça peut être moins : "
+                    "1. [Question reformulée] \n"
+                    "2. [Question reformulée] \n"
+                    "Ne fournissez aucune introduction ni conclusion."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Texte à analyser :\n---BEGIN TEXT---\n"
+                    f"{question}\n---END TEXT---\n"
+                    "Liste TOUTES les questions (explicites ou implicites) posées par le parlementaire."
+                )
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": 350
+    }
+
+
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        text = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError):
+        return []
+
+    # Découper en lignes
+    subquestions = [line.strip("-• ").strip() for line in text.split("\n") if line.strip()]
+    return subquestions[:5]
+
+# Fonction qui génère la réponse à une question parlementaire
 def generate_response(
     question: str,
     legislature: Optional[str] = None,
     rubrique: Optional[str] = None,
-    detail_juridique: int = 3,
-    longueur: str = "Moyenne (500 mots)",
+    detail_juridique: int = 1,
+    longueur: str = "Courte (300 mots)",
     response_orientation: str = "Répondre de façon neutre",
     custom_instructions: str = "",
     include_legal_articles: bool = False,
     must_contain: str = "",
     max_legal_articles: int = 3,
-    model_size: str = "small"   # choix du modèle Mistral
+    model_size: str = "small"
 ):
     try:
         status_placeholder = st.empty()
 
-        # Étape 1 : Recherche d'anciennes questions / réponses parlementaires (uniquement si pas de limitation)
+        # Limites de tokens pour Mistral Large
+        TOKEN_LIMITS = {
+            "large": {
+                "system_prompt": 2000,
+                "question": 1500,
+                "parliamentary_context": 4500,  # 3 réponses QE max
+                "search_context": 3000,         # 15 snippets Google
+                "uploaded_documents": 5000,     # 10 chunks max
+                "legal_context": 5000,          # À affiner plus tard
+                "response": 6000,
+                "safety_margin": 3000,
+            },
+            "medium": {
+                "system_prompt": 1500,
+                "question": 1000,
+                "parliamentary_context": 3000,  # 2 réponses QE max
+                "search_context": 1500,         # 10 snippets Google
+                "uploaded_documents": 2500,     # 5 chunks max
+                "legal_context": 2000,          # À affiner plus tard
+                "response": 4000,               # Réponse plus longue que small
+                "safety_margin": 1500,
+            },
+            "small": {
+                "system_prompt": 1500,          # Même valeur que medium
+                "question": 1000,               # Même valeur que medium
+                "parliamentary_context": 3000,  # 2 réponses QE max (même que medium)
+                "search_context": 1500,         # 10 snippets Google (même que medium)
+                "uploaded_documents": 2500,     # 5 chunks max (même que medium)
+                "legal_context": 2000,          # Même que medium
+                "response": 2000,               # Réponse plus courte que medium
+                "safety_margin": 1500,          # Même que medium
+            }
+        }
+
+        # Utilisation directe des paramètres reçus
+        current_orientation = response_orientation
+        current_longueur = longueur
+        current_detail = detail_juridique
+        current_include_legal = include_legal_articles
+        current_model_size = model_size
+
+        # Étape 1 : Recherche d'anciennes questions
         parliamentary_context = "Aucun contexte parlementaire trouvé."
         similar_documents = []
-        if not (use_priority_docs and selected_docs):
+        if not (hasattr(st.session_state, 'use_priority_docs') and
+                st.session_state.use_priority_docs and
+                hasattr(st.session_state, 'selected_docs') and
+                st.session_state.selected_docs):
             status_placeholder.markdown(
                 '<div class="status-message">🏛️ Recherche dans la base des anciennes questions / réponses...</div>',
                 unsafe_allow_html=True
             )
             similar_documents = search_question_parlementaire(question, top_k=5)
             if similar_documents:
+                # Garder les 5 dans similar_documents, mais n'en utiliser que 3 pour le prompt
+                selected_docs = similar_documents[:3]
                 parliamentary_context = "\n\n".join(
-                    [
-                        f"Contexte parlementaire {i+1} (source: {doc.uid}):\n"
-                        f"Question: {doc.question}\nRéponse: {doc.reponse}"
-                        for i, doc in enumerate(similar_documents)
-                    ]
+                    [f"Contexte parlementaire {i+1} (source: {doc.uid}):\n"
+                     f"Question: {doc.question}\nRéponse: {truncate_text(doc.reponse, max_tokens=TOKEN_LIMITS[current_model_size]['parliamentary_context'] // 3)}"
+                     for i, doc in enumerate(selected_docs)]
                 )
 
-        # Étape 2 : Recherche des articles juridiques (si activée) (uniquement si pas de limitation)
-
+        # Étape 2 : Recherche des articles juridiques
         legal_context = "Aucun texte juridique spécifique n'a été identifié."
         legal_sources = []
-        if not (use_priority_docs and selected_docs) and include_legal_articles:
+        if (not (hasattr(st.session_state, 'use_priority_docs') and
+                st.session_state.use_priority_docs and
+                hasattr(st.session_state, 'selected_docs') and
+                st.session_state.selected_docs)) and current_include_legal:
             status_placeholder.markdown(
-                '<div class="status-message">📚 Recherche dans les codes juridiques (Code du travail, Code de la sécurité sociale, Code de la santé publique, Code de l\'action sociale et des familles)...</div>',
+                '<div class="status-message">📚 Recherche dans les codes juridiques...</div>',
                 unsafe_allow_html=True
             )
             legal_sources_result = search_articles(
@@ -2080,90 +2427,111 @@ def generate_response(
                 threshold=0.5
             )
             legal_sources = legal_sources_result["sources"]
+
             if legal_sources:
+                legal_sources_for_prompt = sort_articles_for_prompt(legal_sources)
+                # Tronquer chaque article juridique
                 legal_context = "\n\n".join(
-                    [f"Article {art.num}: {art.titre}\n{art.article_complet}" for art in legal_sources]
+                    [f"Article {art['num']}: {art['titre']}\n{truncate_text(art['contenu'], max_tokens=TOKEN_LIMITS[current_model_size]['legal_context'] // len(legal_sources_for_prompt))}"
+                     for art in legal_sources_for_prompt]
                 )
 
-        # Étape 3 : Recherche dans les documents uploadés (si mode parlementaire) - limité à 3 résultats
+        # Étape 3 : Recherche dans les documents uploadés
         status_placeholder.markdown(
-            '<div class="status-message">🏛️ Recherche dans la base documentaire...</div>',
+            '<div class="status-message">📄 Recherche dans la base documentaire...</div>',
             unsafe_allow_html=True
         )
-        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=3)
-        # Formatage basé sur la pertinence (seuil = 0.7)
-        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=0.7)
+        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=10)  # Limiter à 10 chunks max
+        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=0.7, max_docs=10)
 
-        # Étape 4 : Recherche internet (si mode parlementaire)
+        # Étape 4 : Recherche internet
         search_context = "Aucune recherche internet effectuée."
         search_results = []
 
-        if not (use_priority_docs and selected_docs) and st.session_state.get("search_engine"):
-            if st.session_state.get("search_engine") == "Tavily":
-                status_placeholder.markdown(
-                    '<div class="status-message">🌐 Recherche internet (Tavily)...</div>',
-                    unsafe_allow_html=True
-                )
+        search_engine = st.session_state.get("search_engine")
+        if (search_engine and
+            not (hasattr(st.session_state, 'use_priority_docs') and
+                 st.session_state.use_priority_docs and
+                 hasattr(st.session_state, 'selected_docs') and
+                 st.session_state.selected_docs)):
+            status_placeholder.markdown(
+                f'<div class="status-message">🌐 Recherche internet ({search_engine})...</div>',
+                unsafe_allow_html=True
+            )
+
+            if search_engine == "Tavily":
                 results = search_tavily_government(extract_subject(question))
                 search_context = results.get("answer", "")
                 search_results = results.get("results", [])
-                # Ajout du contenu des résultats pour enrichir le contexte
                 if search_results:
-                    search_context += "\n\n" + "\n\n".join([item.get("content", "") for item in search_results])
-
-            elif st.session_state.get("search_engine") == "Google":
-                status_placeholder.markdown(
-                    '<div class="status-message">🌐 Recherche internet (Google)...</div>',
-                    unsafe_allow_html=True
-                )
+                    # Limiter à 15 snippets max pour le prompt
+                    truncated_snippets = [item.get("content", "") for item in search_results[:15]]
+                    search_context += "\n\n" + "\n\n".join(
+                        truncate_text(snippet, max_tokens=TOKEN_LIMITS[current_model_size]['search_context'] // 15)
+                        for snippet in truncated_snippets
+                    )
+            elif search_engine == "Google":
                 results = search_google_government(extract_subject(question))
                 search_results = results.get("results", [])
-                # Google renvoie "snippet"
-                search_context = "\n\n".join([item.get("snippet", "") for item in search_results])
+                # Limiter à 15 snippets max pour le prompt
+                truncated_snippets = [item.get("snippet", "") for item in search_results[:15]]
+                search_context = "\n\n".join(
+                    truncate_text(snippet, max_tokens=TOKEN_LIMITS[current_model_size]['search_context'] // 15)
+                    for snippet in truncated_snippets
+                )
 
         # Étape 5 : Génération de la réponse
         status_placeholder.markdown(
             '<div class="status-message">🤖 Génération de la réponse par Mistral...</div>',
             unsafe_allow_html=True
         )
+
         prompt = build_parlementary_response_prompt(
-            question=question,
+            question=truncate_text(question, max_tokens=TOKEN_LIMITS[current_model_size]['question']),
             parliamentary_context=parliamentary_context,
             legal_context=legal_context,
             uploaded_documents=uploaded_docs_context,
-            detail_juridique=detail_juridique,
-            longueur=longueur,
-            response_orientation=response_orientation,
+            detail_juridique=current_detail,
+            longueur=current_longueur,
+            response_orientation=current_orientation,
             custom_instructions=custom_instructions,
             search_context=search_context
         )
-        mistral_response = call_mistral_parlementary_response(
+
+        mistral_response = call_mistral_parliamentary_response(
             prompt,
-            longueur,
+            current_longueur,
             question,
-            model_size=model_size
+            model_size=current_model_size
         )
 
-        # ➡️ Effacer le message
         status_placeholder.empty()
+
+        # Préparation des métadonnées
+        metadata = {
+            "mode": "parlementaire",
+            "timestamp": datetime.now(pytz.timezone('Europe/Paris')).isoformat(),
+            "model_used": f"mistral-{current_model_size}-latest",
+            "include_legal_articles": current_include_legal,
+            "longueur": current_longueur,
+            "response_orientation": current_orientation,
+            "detail_juridique": current_detail,
+            "legislature": legislature,
+            "rubrique": rubrique,
+            "custom_instructions": custom_instructions
+        }
 
         return {
             "question": question,
-            "context": [doc.reponse for doc in similar_documents[:6] if doc.reponse],
+            "context": [doc.reponse for doc in similar_documents[:6] if hasattr(doc, 'reponse')],
             "context_str": parliamentary_context,
             "legal_context": legal_context,
             "response": mistral_response,
-            "legal_sources": legal_sources if include_legal_articles else [],
-            "similar_documents": similar_documents,
+            "legal_sources": legal_sources if current_include_legal else [],
+            "similar_documents": similar_documents,  # Retourner les 5 documents similaires
             "uploaded_documents": uploaded_results,
             "search_results": search_results,
-            "metadata": {
-                "status": "success",
-                "model_used": f"mistral-{model_size}-latest",
-                "timestamp": datetime.now(pytz.timezone('Europe/Paris')).isoformat(),
-                "legislature": legislature,
-                "rubrique": rubrique
-            }
+            "metadata": metadata
         }
 
     except Exception as e:
@@ -2218,6 +2586,26 @@ config = {
             "Isabelle": {
                 "name": "Caudilla Isabelle",
                 "password": os.getenv("USER_ISABELLE_PASSWORD")
+            },
+            "Arnaud": {
+                "name": "Arnaud",
+                "password": os.getenv("USER_ARNAUD_PASSWORD")
+            },
+            "DGCS": {
+                "name": "DGCS",
+                "password": os.getenv("USER_DGCS_PASSWORD")
+            },
+            "DSS": {
+                "name": "DSS",
+                "password": os.getenv("USER_DSS_PASSWORD")
+            },
+            "Julien": {
+                "name": "Special Guest",
+                "password": os.getenv("USER_SPECIAL_PASSWORD")
+            },
+            "Invité": {
+                "name": "Invité",
+                "password": os.getenv("USER_GUEST_PASSWORD")
             }
         }
     }
@@ -2266,8 +2654,6 @@ if st.session_state.authentication_status is not True:
     if st.session_state.authentication_status is False:
         st.error("Identifiants incorrects. Veuillez réessayer.")
 
-
-
 else:
     # Réafficher la sidebar après connexion
 
@@ -2290,7 +2676,7 @@ else:
     if not st.session_state.full_historique and "historique_cache" in st.session_state:
         st.session_state.full_historique = st.session_state.historique_cache
 
-# --- 6. Configuration de la page et CSS ---
+# --- Configuration de la page et CSS ---
     st.markdown("""
     <style>
         /* Élargir le conteneur principal */
@@ -2339,8 +2725,8 @@ else:
 
     st.title("🏛️ Générateur de réponses aux questions écrites parlementaires")
     st.markdown("""
-    Application (version Beta) de réponse aux questions parlementaires,
-    appuyée sur une base documentaire (embedding avec **camemBERT**), un moteur de recherche (**Tavily** ou **Google**) et le modèle **Mistral**.
+    Application de réponse aux questions parlementaires,
+    appuyée sur une base documentaire (embedding avec **camemBERT** finetuné), un moteur de recherche (**Tavily** ou **Google**) et les modèles **Mistral**.
     """)
 
 #################################################################
@@ -2380,14 +2766,14 @@ else:
 
         # Paramètres de mode
         mode = st.radio(
-            "Type de réponse souhaitée",
-            ["Réponse parlementaire"], # Ajouter , "Analyse juridique" pour avoir le second mode - Permet de moduler les modes accessibles sur le site
+            "Choix du module",
+            ["Réponse parlementaire", "Base documentaire", "Analyse juridique"], # Ajouter , "Analyse juridique" pour avoir le second mode - Permet de moduler les modes accessibles sur le site
             index=0
         )
 
         # Conteneur pour contrôler la largeur du bouton
         button_container = st.container()
-        # Initialisation des bouton à False
+        # Initialisation des boutons à False
         generate_parliamentary_button = False
         generate_analysis_button = False
         with button_container:
@@ -2430,26 +2816,15 @@ else:
         # Séparateur
         st.markdown("---")
 
-        # Case à cocher pour Gérer la base documentaire
-        if 'manage_doc_base' not in st.session_state:
-            st.session_state.manage_doc_base = False
-
-        manage_doc_base = st.checkbox(
-            "Gérer la base documentaire",
-            value=st.session_state.manage_doc_base,
-            key="manage_doc_base_checkbox",
-            help="Active l'interface pour ajouter/supprimer des documents dans le RAG"
-        )
 
 ##########################################################################
 ### ------ 3b. INTERFACE DE GESTION DE LA BASE DOCUMENTAIRE ---------- ###
 ##########################################################################
 
-    # Initialisation du bouton search (A REPOSITIONNER)
+    # Initialisation du bouton search
     search_button = False
-    # Affichage conditionnel de l'interface de gestion de la base documentaire
-    if manage_doc_base:
-        st.session_state.manage_doc_base = True  # Met à jour l'état
+    
+    if mode == "Base documentaire":
         st.markdown("---")
         st.markdown("#### 📚 Gestion de la base documentaire")
 
@@ -2617,100 +2992,192 @@ else:
                                 st.rerun()
 
         except Exception as e:
-            st.error(f"Erreur: {e}")
+            st.error(f"Erreur lors de la récupération des collections : {e}")
 
-        # 2. Section d'upload de documents
+        # --- Section de téléchargement depuis un lien public ---
         st.markdown("---")
-        st.markdown("**Ajouter un document**")
+        st.markdown("**Ajouter un document (max 50 Mo) depuis un lien public**")
 
-        uploaded_file = st.file_uploader(
-            "Sélectionnez un PDF ou Word",
-            type=["pdf", "docx"],
-            key="doc_uploader"
+        def make_direct_link(file_url: str, prefer_format: str = "docx") -> str:
+            """
+            Convertit les liens Google Docs / Google Drive / Dropbox / OneDrive en liens directs téléchargeables.
+            - prefer_format: "docx" ou "pdf" pour Google Docs.
+            Retourne le lien original si aucun cas particulier n'est détecté.
+            """
+            u = file_url.strip()
+
+            # --- Google Docs (document, pas un fichier Drive) ---
+            if "docs.google.com/document" in u:
+                m = re.search(r"/document/d/([^/]+)/", u)
+                doc_id = m.group(1) if m else None
+                if doc_id:
+                    fmt = "docx" if prefer_format == "docx" else "pdf"
+                    return f"https://docs.google.com/document/d/{doc_id}/export?format={fmt}"
+                return u
+
+            # --- Google Drive (fichiers) ---
+            if "drive.google.com" in u:
+                file_id = None
+                if "/d/" in u:
+                    file_id = u.split("/d/")[1].split("/")[0]
+                else:
+                    qs_id = parse_qs(urlparse(u).query).get("id", [None])[0]
+                    file_id = qs_id or file_id
+                if file_id:
+                    return f"https://drive.google.com/uc?export=download&id={file_id}"
+                return u
+
+            # --- Dropbox ---
+            if "dropbox.com" in u:
+                # Force le téléchargement direct
+                if "dl=" in u:
+                    u = re.sub(r"dl=\d", "dl=1", u)
+                else:
+                    sep = "&" if urlparse(u).query else "?"
+                    u = u + f"{sep}dl=1"
+                # Variante possible : remplacer dl=1 par raw=1
+                # u = u.replace("dl=1", "raw=1")
+                return u
+
+            # --- OneDrive ---
+            if "1drv.ms" in u or "onedrive.live.com" in u:
+                if "download=" not in u:
+                    parsed = urlparse(u)
+                    sep = "&" if parsed.query else "?"
+                    return u + f"{sep}download=1"
+                return u
+
+            return u
+
+        file_url = st.text_input(
+            "🔗 Collez ici le lien public vers votre document (Google Drive, Dropbox, OneDrive, etc.) :",
+            key="file_url_input",
+            placeholder="Ex: https://drive.google.com/uc?export=download&id=..."
         )
 
-        if uploaded_file:
-            # Champ pour le nom personnalisé (sera aussi le nom de la collection)
-            default_name = os.path.splitext(uploaded_file.name)[0]
+        if file_url:
+            direct_url = make_direct_link(file_url)
+            default_name = os.path.splitext(urlparse(direct_url).path.split('/')[-1])[0]
             custom_name = st.text_input(
-                "Nom du document (sera aussi le nom de la collection):",
+                "Nom du document (sera aussi le nom de la collection) :",
                 value=default_name,
                 key="doc_name_input"
             )
 
-            if st.button("Ajouter le document", key="add_document"):
-                if not custom_name.strip():
-                    st.warning("Veuillez entrer un nom valide.")
-                else:
-                    # Génération du nom de la collection (avec timestamp caché pour l'unicité)
-                    display_name = custom_name.strip().replace(" ", "_")  # Nom affiché (sans timestamp)
-                    collection_name = f"{display_name}__{int(datetime.now().timestamp())}"  # Nom interne (avec timestamp)
+            # Bouton de validation du lien
+            if st.button("✅ Valider le lien"):
+                try:
+                    response = requests.get(direct_url, stream=True, timeout=10)
+                    if response.status_code == 200:
+                        st.success("Lien valide et accessible ✅")
+                    else:
+                        st.error(f"❌ Lien inaccessible (status {response.status_code})")
+                except Exception as e:
+                    st.error(f"❌ Erreur lors de la validation : {e}")
 
-                    # Initialisation de la barre de progression
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+            # Bouton de téléchargement
+            if st.button("📥 Télécharger et traiter le document"):
+                try:
+                    response = requests.get(direct_url, stream=True, timeout=30)
+                    response.raise_for_status()
 
-                    def update_progress(current, total, message):
-                        """Met à jour la barre de progression et le statut."""
-                        percent = int((current / total) * 100) if total > 0 else 0
-                        progress_bar.progress(percent)
-                        status_text.text(f"{message} ({current}/{total})")
+                    file_size = int(response.headers.get('content-length', 0))
+                    if file_size > 50 * 1024 * 1024:
+                        st.error("❌ Fichier trop gros (max 50 Mo).")
+                    else:
+                        with st.spinner("Téléchargement en cours..."):
+                            downloaded = 0
+                            total_size = file_size
+                            progress_bar = st.progress(0)
 
-                    try:
-                        # Création de la collection
-                        status_text.text("Création de la collection dans Qdrant...")
-                        qdrant_client.create_collection(
-                            collection_name=collection_name,
-                            vectors_config=models.VectorParams(
-                                size=1024,
-                                distance=models.Distance.COSINE
+                            # Déterminer l’extension via content-type ou fallback
+                            content_type = response.headers.get("content-type", "").lower()
+
+                            if "pdf" in content_type or direct_url.lower().endswith(".pdf"):
+                                file_extension = "pdf"
+                            elif "docx" in content_type or "wordprocessingml" in content_type or direct_url.lower().endswith(".docx"):
+                                file_extension = "docx"
+                            else:
+                                # fallback par défaut : PDF
+                                file_extension = "pdf"
+
+                            # Créer un fichier temporaire
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as f:
+                                for chunk in response.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                                tmp_path = f.name
+
+                            # Vérification rapide du contenu
+                            with open(tmp_path, "rb") as f:
+                                header = f.read(5)
+                                if file_extension == "pdf" and not header.startswith(b"%PDF"):
+                                    st.error("❌ Le fichier téléchargé n'est pas un PDF valide.")
+                                    os.unlink(tmp_path)
+                                    st.stop()
+                                if file_extension == "docx":
+                                    import zipfile
+                                    try:
+                                        with zipfile.ZipFile(tmp_path, 'r') as z:
+                                            if '[Content_Types].xml' not in z.namelist():
+                                                st.error("❌ Le fichier téléchargé n'est pas un DOCX valide.")
+                                                os.unlink(tmp_path)
+                                                st.stop()
+                                    except Exception:
+                                        st.error("❌ Le fichier téléchargé n'est pas un DOCX valide.")
+                                        os.unlink(tmp_path)
+                                        st.stop()
+
+                        # Créer une collection Qdrant avec suivi d'avancement
+                        collection_name = f"{custom_name.replace(' ', '_')}__{int(datetime.now().timestamp())}"
+
+                        progress = st.progress(0)
+                        status = st.empty()
+
+                        status.info("📂 Initialisation de la collection...")
+                        progress.progress(10)
+
+                        try:
+                            qdrant_client.create_collection(
+                                collection_name=collection_name,
+                                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE)
                             )
-                        )
+                            status.success(f"✅ Collection '{collection_name}' créée.")
+                            progress.progress(30)
 
-                        # Sauvegarde du fichier temporaire
-                        status_text.text("Sauvegarde du fichier temporaire...")
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
-                            tmp_file.write(uploaded_file.getvalue())
-                            tmp_path = tmp_file.name
+                            # Traiter et indexer le document
+                            status.info("📑 Extraction et préparation du texte...")
+                            success = process_and_index_document(
+                                file_path=tmp_path,
+                                file_type=file_extension,
+                                collection_name=collection_name,
+                                qdrant_client=qdrant_client,
+                                embedding_model=embedding_model,
+                                progress_callback=lambda current, total, message: (
+                                    progress.progress(min(current/total, 1.0)),
+                                    status.info(message)
+                                )
+                            )
 
-                        # Appel de la fonction avec callback
-                        status_text.text("Traitement et indexation en cours...")
-                        success = process_and_index_document(
-                            file_path=tmp_path,
-                            file_type=uploaded_file.name.split('.')[-1],
-                            collection_name=collection_name,
-                            qdrant_client=qdrant_client,
-                            embedding_model=embedding_model,
-                            progress_callback=update_progress  # ← Callback ajouté
-                        )
+                            if success:
+                                progress.progress(100)
+                                status.success(f"✅ Document ajouté sous le nom '{custom_name}' !")
+                                collection_info = qdrant_client.get_collection(collection_name)
+ #                                st.info(f"📊 Nombre de vecteurs indexés : {collection_info.vectors_count}")
+                            else:
+                                status.error("❌ Échec du traitement.")
 
-                        if success:
-                            status_text.text("Document ajouté avec succès !")
-                            progress_bar.progress(100)
-                            st.success(f"✅ Document ajouté sous le nom '{custom_name}' !")
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la récupération des collections : {e}")
 
-                            if os.path.exists(tmp_path):
-                                os.unlink(tmp_path)
-
-                            st.session_state.manage_doc_base = False
-                            st.rerun()
-                        else:
-                            status_text.text("Échec de l'ajout du document")
-                            st.error("❌ Échec de l'ajout.")
-
-                    except Exception as e:
-                        status_text.text(f"Erreur: {str(e)}")
-                        st.error(f"Erreur: {e}")
-                    finally:
-                        time.sleep(2)  # Laisse le temps de voir le résultat
-                        progress_bar.empty()
-                        status_text.empty()
+                except Exception as e:
+                    st.error(f"❌ Echec du traitement du document {e}")
 
 #########################################################################################
 #### ---------- 3c. INTERFACE DE REPONSE AUX QUESTIONS PARLEMENTAIRES -------------- ####
 #########################################################################################
 
-    else:
+    elif mode == "Réponse parlementaire" or mode == "Analyse juridique":
         st.markdown("#### Question parlementaire")
         question = st.text_area(
             "Question parlementaire",   # libellé non vide
@@ -2720,14 +3187,24 @@ else:
             label_visibility="collapsed"
         )
 
+        # Si le texte change, on efface les sous-questions précédentes
+        if "last_question" not in st.session_state:
+            st.session_state["last_question"] = ""
+
+        if st.session_state["question_input"] != st.session_state["last_question"]:
+            st.session_state["last_question"] = st.session_state["question_input"]
+            st.session_state.pop("subquestions", None)
+
         # Initialisation des variables des boutons (pour éviter NameError)
         search_button = False
 
         # --- Boutons conditionnels selon le mode ---
+
         if mode == "Réponse parlementaire":
-            # --- Paramètres de réponse ---
             st.markdown("#### Paramètres de réponse")
-            col1, col2, col3 = st.columns(3)
+
+            # Première ligne : Orientation (2/3) + Longueur (1/3)
+            col1, col2, col3 = st.columns([2, 1, 0.0001])
             with col1:
                 response_orientation_options = [
                     "Répondre de façon neutre",
@@ -2735,66 +3212,123 @@ else:
                     "Répondre positivement aux propositions du parlementaire",
                     "Répondre de manière technique et détaillée"
                 ]
-                selected_orientation = st.selectbox(
+                response_orientation = st.selectbox(
                     "Orientation de la réponse",
                     response_orientation_options,
-                    index=0
+                    index=0,
+                    key="response_orientation"
                 )
+
             with col2:
                 longueur = st.selectbox(
                     "Longueur de la réponse",
                     ["Courte (300 mots)", "Moyenne (500 mots)", "Longue (1000 mots)"],
-                    index=1
+                    index=0,  # "Courte" par défaut
+                    key="longueur"
                 )
-            with col3:
-                include_legal_articles = st.selectbox(
-                    "Inclure une recherche dans les codes juridiques",
-                    ["Non", "Oui"],
-                    index=0,
-                    key="include_legal_articles_select"
-                ) == "Oui"
 
-            MAX_LEN = 300
-
-            # Ligne avec deux colonnes : champ texte + case à cocher
-            colA, colB = st.columns([2, 1])
-
+            # Deuxième ligne : Détail juridique (1/3) + Inclure recherche (1/3) + Articles optionnels (1/3)
+            colA, colB, colC = st.columns(3)
             with colA:
-                MAX_LEN = 300
-                custom_instructions = st.text_area(
-                    "Optionnel : instructions supplémentaires pour la réponse (max. 300 caractères)",
-                    placeholder="Ex: Insister sur l'aspect budgétaire, mentionner le projet de loi X...",
-                    height=100,
-                    key="custom_instructions"
-                )
-                if custom_instructions:
-                    remaining = MAX_LEN - len(custom_instructions)
-                    if remaining < 0:
-                        st.warning(f"⚠️ Vous avez dépassé la limite de {MAX_LEN} caractères ({len(custom_instructions)} actuellement).")
-                        custom_instructions = custom_instructions[:MAX_LEN]
-
-            with colB:
                 detail_juridique = st.slider(
                     "Niveau de détail juridique (1 = bas, 5 = élevé)",
                     min_value=1,
                     max_value=5,
-                    value=3
+                    value=1,  # Valeur par défaut
+                    key="detail_juridique"
                 )
 
-                if include_legal_articles:
-                    must_contain = st.text_input(
-                        "Optionnel : les articles sélectionnés doivent contenir (mot ou expression exacte)",
-                        key="must_contain_input",
-                        placeholder="Ex: allocation, article 123, décret 2020-..."
-                    )
-                else:
-                    must_contain = ""
+            with colB:
+                include_legal_articles = st.selectbox(
+                    "Inclure une recherche dans les codes juridiques",
+                    ["Non", "Oui"],
+                    index=0,
+                    key="include_legal_articles"
+                ) == "Oui"
 
-            st.markdown("**Limiter les documents sources** (attention : la réponse n'intègre ni plus les anciennes QE, ni les textes juridiques et ni la recherche internet)")
+            with colC:
+                must_contain = st.text_input(
+                    "Si oui, les articles sélectionnés doivent contenir exactement (optionnel)",
+                    key="must_contain_input",
+                    placeholder="Ex: allocation, article 123, décret 2020-..."
+                )
+
+            # Debug temporaire pour vérifier les valeurs
+            st.markdown("---")
+            with st.expander("🔍 Vérifier les paramètres actuels"):
+                st.write("**Valeurs disponibles dans session_state:**")
+                debug_info = {
+                    "Orientation": st.session_state.get('response_orientation', 'Non défini'),
+                    "Longueur": st.session_state.get('longueur', 'Non défini'),
+                    "Détail juridique": st.session_state.get('detail_juridique', 'Non défini'),
+                    "Articles juridiques": st.session_state.get('include_legal_articles', 'Non défini'),
+                    "Contenu obligatoire": st.session_state.get('must_contain_input', 'Non défini')
+                }
+                st.json(debug_info)
+
+            st.markdown(
+                "<hr style='border:1px solid #bbb; width:100%;'>",
+                unsafe_allow_html=True
+            )
+
+            # Bloc Instructions pour la réponse
+            MAX_LEN = 300
+            st.markdown("#### Instructions pour la réponse (optionnel)")
+            st.markdown("##### Instructions générales (max. 300 caractères)")
+
+            custom_instructions = st.text_area(
+                "Instructions générales",
+                placeholder="Ex: Insister sur l'aspect budgétaire, mentionner le projet de loi X...",
+                height=100,
+                key="custom_instructions",
+                label_visibility="collapsed"
+            )
+
+            if custom_instructions:
+                remaining = MAX_LEN - len(custom_instructions)
+                if remaining < 0:
+                    st.warning(
+                        f"⚠️ Vous avez dépassé la limite de {MAX_LEN} caractères "
+                        f"({len(custom_instructions)} actuellement)."
+                    )
+                    custom_instructions = custom_instructions[:MAX_LEN]
+
+            st.markdown("##### Instructions par sous-question (par défaut - ou si le champ est laissé vide - chaque sous-question est traitée sans instruction spécifique)")
+
+            # Bouton discret pour lancer la décomposition en sous-questions
+            if st.button("➕ Ajouter des instructions par sous-question", help="Décompose la question en sous-questions"):
+                subquestions = extract_subquestions(st.session_state.get("question_input", ""))
+                st.session_state["subquestions"] = subquestions
+
+            # Affichage des sous-questions avec champs d'instructions
+            if "subquestions" in st.session_state:
+                for i, sq in enumerate(st.session_state["subquestions"], start=1):
+                    with st.expander(f"Sous-question : {sq}"):
+                        if i == 1:
+                            # Exemple uniquement pour la sous-question 1
+                            st.text_area(
+                                f"Instructions pour la sous-question {i} (max. 200 caractères)",
+                                key=f"instructions_sq_{i}",
+                                max_chars=200,
+                                height=80,
+                                placeholder="Ex : Renvoyer cette question au débat parlementaire sur le projet loi..., Rappeler qu'une concertation est en cours pour répondre à ce problème, Refuser la proposition au motif que..."
+                                # ou bien value="Exemple : Insister sur l'aspect budgétaire de la réponse"
+                            )
+                        else:
+                            st.text_area(
+                                f"Instructions pour la sous-question {i} (max. 200 caractères)",
+                                key=f"instructions_sq_{i}",
+                                max_chars=200,
+                                height=80
+                            )
+
+
+            st.markdown("#### Limiter les documents sources (optionnel)")
             use_priority_docs = st.checkbox(
                 "Rechercher uniquement dans les documents suivants :",
                 value=False,
-                key="use_priority_docs"
+                key="use_priority_docs",
+                help="Attention : la réponse n'intègre ni plus les anciennes QE, ni les textes juridiques et ni la recherche internet"
             )
 
             if use_priority_docs:
@@ -2814,10 +3348,15 @@ else:
                     key="priority_docs",
                     placeholder="Choisir..."
                 )
+            
+            st.markdown(
+                "<hr style='border:1px solid #bbb; width:100%;'>",
+                unsafe_allow_html=True
+            )
 
         elif mode == "Analyse juridique":
             # --- Paramètres de recherche juridique ---
-            st.markdown("### Paramètres de recherche juridique")
+            st.markdown("#### Paramètres de recherche juridique")
             col1, col2, col3 = st.columns(3)
             with col1:
                 must_contain = st.text_input("🔎 Doit contenir (mot ou expression exacte)", key="must_contain_input")
@@ -2825,7 +3364,7 @@ else:
                 threshold = st.selectbox(
                     "📊 Seuil de sélection",
                     [0.4, 0.5, 0.6, 0.65, 0.70, 0.75, 0.80, 0.85],
-                    index=2,
+                    index=1,
                     key="threshold_select"
                 )
             with col3:
@@ -2840,6 +3379,11 @@ else:
             # --- Affichage du bouton d'analyse juridique ---
             search_button = st.button("Rechercher les articles", type="secondary", key="search_button")
 
+            st.markdown(
+                "<hr style='border:1px solid #bbb; width:100%;'>",
+                unsafe_allow_html=True
+            )
+
 ###################################################################
 #### --------------- 4. GENERATION DE LA REPONSE ------------- ####
 ###################################################################
@@ -2851,19 +3395,26 @@ else:
             try:
                 debug_logs = ""
                 response_data = {}
-                stats = {}
+
+                # Récupération des valeurs depuis st.session_state
+                response_orientation = st.session_state.get('response_orientation', "Répondre de façon neutre")
+                longueur = st.session_state.get('longueur', "Courte (300 mots)")
+                detail_juridique = st.session_state.get('detail_juridique', 1)
+                include_legal_articles = st.session_state.get('include_legal_articles', False)
+                must_contain = st.session_state.get('must_contain_input', "")
+                model_size = st.session_state.get('model_size', 'small')
 
                 if mode == "Réponse parlementaire":
-                    # Logique inchangée pour le mode "Réponse parlementaire"
                     response_data = generate_response(
                         question=question,
                         detail_juridique=detail_juridique,
                         longueur=longueur,
-                        response_orientation=selected_orientation,
+                        response_orientation=response_orientation,
                         custom_instructions=custom_instructions,
                         include_legal_articles=include_legal_articles,
                         must_contain=must_contain if include_legal_articles else "",
-                        max_legal_articles=detail_juridique # le nombre d'articles est égal au niveau de détail juridique
+                        max_legal_articles=detail_juridique,
+                        model_size=model_size
                     )
 
                 elif mode == "Analyse juridique":
@@ -2873,8 +3424,8 @@ else:
                         max_articles=max_articles,
                         threshold=threshold,
                         model_size=model_size,
-                        search_button=search_button,  # Bouton "Rechercher les articles"
-                        generate_analysis_button=generate_analysis_button  # Bouton "Générer l'analyse"
+                        search_button=search_button,
+                        generate_analysis_button=generate_analysis_button
                     )
 
                 # Détermination des onglets à afficher
@@ -2887,7 +3438,7 @@ else:
                 elif mode == "Analyse juridique":
                     tabs = ["⚖️ Articles juridiques"]
                     if generate_analysis_button and response_data.get("response"):
-                        tabs.insert(0, "📜 Analyse")  # Ajoute "Analyse" en premier si générée
+                        tabs.insert(0, "📜 Analyse")
 
                 # Création dynamique des onglets
                 if tabs:
@@ -2896,6 +3447,7 @@ else:
                     # Affichage du contenu en fonction des onglets
                     for i, tab in enumerate(st_tabs):
                         with tab:
+                            # [Votre code existant pour l'affichage des onglets...]
                             if mode == "Réponse parlementaire":
                                 if "📜 Réponse" in tabs[i]:
                                     st.markdown("#### Réponse générée")
@@ -2903,19 +3455,18 @@ else:
                                     if response_data.get("debug_logs"):
                                         with st.expander("🐛 Voir les logs de recherche"):
                                             st.text_area("Logs", response_data["debug_logs"], height=200)
-                                    # Bouton d'export
                                     if response_data.get("response"):
                                         export_content = build_export_content(
                                             response_data,
-                                            mode="parlementaire",  # ← Mode codé en dur (valide car dans le bloc "Réponse parlementaire")
-                                            include_legal_articles=include_legal_articles  # ← Utilise la variable existante
+                                            mode="parlementaire",
+                                            include_legal_articles=include_legal_articles
                                         )
                                         st.download_button(
                                             label="📥 Exporter en TXT",
                                             data=export_content.encode("utf-8"),
-                                            file_name="export_reponse_parlementaire.txt",  # ← Nom de fichier plus clair
+                                            file_name="export_reponse_parlementaire.txt",
                                             mime="text/plain",
-                                            key=f"export_reponse_{i}"  # ← Clé unique basée sur l'index
+                                            key=f"export_reponse_{i}"
                                         )
                                     st.markdown('<div style="height: 300px;"></div>', unsafe_allow_html=True)
 
@@ -2950,22 +3501,84 @@ else:
                                     st.markdown('<div style="height: 300px;"></div>', unsafe_allow_html=True)
 
                                 elif "⚖️ Articles juridiques" in tabs[i]:
-                                    st.markdown("#### Articles juridiques pertinents")
-
+                                    st.markdown("###### 📚 Articles juridiques pertinents")
                                     legal_sources = response_data.get("legal_sources", [])
-
                                     if not legal_sources:
-                                        st.info("Aucun texte juridique cité.")
+                                        st.info("Aucun article juridique trouvé.")
                                     else:
-                                        for idx, art in enumerate(legal_sources):
-                                            score = f"{art.score:.2f}" if art.score is not None else "N/A"
-                                            with st.expander(f"{idx+1}. Article {art.num} ({art.collection}) - Score : {score}"):
-                                                st.markdown(f"**Titre:** {art.titre}")
-                                                st.markdown(f"**Contexte hiérarchique:** {art.contexte_hierarchique}")
-                                                st.markdown(f"**Texte complet:**\n\n{art.article_complet}")
+                                        # 1. Regroupement par code juridique
+                                        by_code = {}
+                                        for art in legal_sources:
+                                            code = art.get("collection", "Inconnu")
+                                            if code not in by_code:
+                                                by_code[code] = []
+                                            by_code[code].append(art)
+
+                                        # 2. Affichage par code avec hiérarchie textuelle
+                                        for code, articles in by_code.items():
+                                            st.markdown(f"##### 📚 {code}")
+
+                                            # Regroupement par contexte hiérarchique complet
+                                            by_contexte = {}
+                                            for art in articles:
+                                                contexte = art.get("contexte_hierarchique", "Sans contexte")
+                                                if contexte not in by_contexte:
+                                                    by_contexte[contexte] = []
+                                                by_contexte[contexte].append(art)
+
+                                            # 3. Affichage de chaque contexte avec ses articles
+                                            for contexte, arts in by_contexte.items():
+                                                # Affichage du contexte hiérarchique en texte
+                                                st.markdown(f"###### {contexte.replace('>', ' > ')}")
+
+                                                # Affichage des articles de ce contexte
+                                                for art in arts:
+                                                    # Détermination du type et de l'icône
+                                                    provenance = art.get("provenance", "initial")
+                                                    score = art.get("score")
+
+                                                    if provenance == "initial":
+                                                        icon = "🔍"
+                                                        if score is not None:
+                                                            label = f"Article initial - score: {score:.3f}"
+                                                        else:
+                                                            label = "Article initial"
+                                                    elif provenance == "context":
+                                                        icon = "📑"
+                                                        label = "Article de contexte"
+                                                    elif provenance == "reference":
+                                                        icon = "🔗"
+                                                        label = "Article référencé"
+                                                    else:
+                                                        icon = "📄"
+                                                        label = "Article"
+
+                                                    # Expander pour chaque article
+                                                    with st.expander(f"{icon} {art.get('num', '?')} - {art.get('titre', '')} ({label})"):
+                                                        st.markdown(f"**Collection:** {art.get('collection', '')}")
+                                                        st.markdown(f"**Numéro:** {art.get('num', '')}")
+                                                        if provenance == "initial" and score is not None:
+                                                            st.markdown(f"**Score:** {score:.3f}")
+                                                        st.markdown(f"**Contexte hiérarchique:** {art.get('contexte_hierarchique', '')}")
+                                                        st.markdown(f"**Contenu:**\n\n{art.get('contenu', '')}")
+
+                                        # 4. Légende des icônes
+                                        st.markdown("""
+                                        **Légende des icônes:**
+                                        - 🔍: Article "initial" (issu de la recherche dans les codes juridiques, avec score de pertinence)
+                                        - 📑: Article de contexte (même section/paragraphe qu'un article "initial")
+                                        - 🔗: Article référencé (référencé par un article initial)
+                                        """)
+
 
                                 elif "📰 Recherches actualités" in tabs[i]:
                                     st.markdown("#### Dernières annonces et actualités gouvernementales")
+
+                                    # Afficher le résumé global si disponible
+                                    summary = response_data.get("search_context") or response_data.get("answer")
+                                    if summary:
+                                        st.markdown(f"**Résumé de la recherche :**\n\n{summary}")
+
                                     search_results = response_data.get("search_results", [])
                                     if not search_results:
                                         st.info("Aucune actualité trouvée via le moteur de recherche.")
@@ -3052,21 +3665,113 @@ else:
                                     st.markdown('<div style="height: 300px;"></div>', unsafe_allow_html=True)
 
                                 elif "⚖️ Articles juridiques" in tabs[i]:
-                                    st.markdown("#### Articles juridiques pertinents")
-
-                                    # Vérification de la présence de sources
-                                    if not response_data.get("sources"):
+                                    st.markdown("###### 📚 Articles juridiques pertinents")
+                                    sources = response_data.get("sources", [])
+                                    if not sources:
                                         st.info("Aucun article juridique trouvé.")
                                     else:
-                                        # Construction de l'arbre législatif (comme dans ton code original)
-                                        tree = {}
-                                        for source in response_data["sources"]:
-                                            art = source["article"]  # Objet RetrievedLegalDocument
-                                            add_to_tree(tree, art, source)  # Ajoute l'article à l'arbre
+                                        # 1. Regroupement par code juridique
+                                        by_code = {}
+                                        for art in sources:
+                                            code = art.get("collection", "Inconnu")
+                                            if code not in by_code:
+                                                by_code[code] = []
+                                            by_code[code].append(art)
 
-                                        # Affichage de l'arbre avec render_tree
-                                        render_tree(st, tree)
+                                        # 2. Affichage par code avec hiérarchie textuelle
+                                        for code, articles in by_code.items():
+                                            st.markdown(f"##### 📚 {code}")
 
+                                            # Regroupement par contexte hiérarchique complet
+                                            by_contexte = {}
+                                            for art in articles:
+                                                contexte = art.get("contexte_hierarchique", "Sans contexte")
+                                                if contexte not in by_contexte:
+                                                    by_contexte[contexte] = []
+                                                by_contexte[contexte].append(art)
+
+                                            # 3. Affichage de chaque contexte avec ses articles
+                                            for contexte, arts in by_contexte.items():
+                                                # Affichage du contexte hiérarchique en texte
+                                                st.markdown(f"###### {contexte.replace('>', ' > ')}")
+
+                                                # Affichage des articles de ce contexte
+                                                for art in arts:
+                                                    # Détermination du type et de l'icône
+                                                    provenance = art.get("provenance", "initial")
+                                                    score = art.get("score")
+
+                                                    if provenance == "initial":
+                                                        icon = "🔍"
+                                                        if score is not None:
+                                                            label = f"Article initial - score: {score:.3f}"
+                                                        else:
+                                                            label = "Article initial"
+                                                    elif provenance == "context":
+                                                        icon = "📑"
+                                                        label = "Article de contexte"
+                                                    elif provenance == "reference":
+                                                        icon = "🔗"
+                                                        label = "Article référencé"
+                                                    else:
+                                                        icon = "📄"
+                                                        label = "Article"
+
+                                                    # Expander pour chaque article
+                                                    with st.expander(f"{icon} {art.get('num', '?')} - {art.get('titre', '')} ({label})"):
+                                                        st.markdown(f"**Collection:** {art.get('collection', '')}")
+                                                        st.markdown(f"**Numéro:** {art.get('num', '')}")
+                                                        if provenance == "initial" and score is not None:
+                                                            st.markdown(f"**Score:** {score:.3f}")
+                                                        st.markdown(f"**Contexte hiérarchique:** {art.get('contexte_hierarchique', '')}")
+                                                        st.markdown(f"**Contenu:**\n\n{art.get('contenu', '')}")
+
+                                        # 4. Légende des icônes
+                                        st.markdown("""
+                                        **Légende des icônes:**
+                                        - 🔍: Article initial de la recherche (avec score si disponible)
+                                        - 📑: Article de contexte (même section/paragraphe)
+                                        - 🔗: Article référencé
+                                        """)
+
+                # === NOUVELLE PARTIE POUR L'HISTORIQUE ===
+                # Génération de la clé unique pour l'historique
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                q_hash = hashlib.md5(f"{question}_{timestamp}".encode()).hexdigest()
+
+                # Préparation des métadonnées
+                metadata = {
+                    "mode": mode,
+                    "timestamp": datetime.now(pytz.timezone('Europe/Paris')).isoformat(),
+                    "model_used": f"mistral-{model_size}-latest",
+                    "include_legal_articles": include_legal_articles,
+                    "longueur": longueur,
+                    "response_orientation": response_orientation,
+                    "detail_juridique": detail_juridique,
+                    "legislature": None,
+                    "rubrique": None,
+                    "custom_instructions": custom_instructions
+                }
+
+                # Ajout des métadonnées à response_data
+                response_data["metadata"] = metadata
+
+                # Initialisation de l'historique si nécessaire
+                if "full_historique" not in st.session_state:
+                    st.session_state.full_historique = {}
+
+                # Ajout à l'historique
+                st.session_state.full_historique[q_hash] = {
+                    "question": question,
+                    "response": response_data.get("response", "Pas de réponse générée"),
+                    "similar_documents": response_data.get("similar_documents", []),
+                    "legal_sources": response_data.get("legal_sources", []),
+                    "sources": response_data.get("sources", []),
+                    "search_results": response_data.get("search_results", []),
+                    "uploaded_documents": response_data.get("uploaded_documents", []),
+                    "metadata": metadata
+                }
+                save_historique()
 
             except Exception as e:
                 st.error(f"Erreur inattendue: {str(e)}")
@@ -3076,83 +3781,23 @@ else:
 #### -------- 5. GESTION ET AFFICHAGE DE L'HISTORIQUE -------- ####
 ###################################################################
 
-    # Initialisation du mode
-    mode_value = mode.lower().replace(" ", "_")  # "réponse_parlementaire" ou "analyse_juridique"
-    # Ajout d'une entrée à l'historique après génération d'une réponse
-    if generate_parliamentary_button or generate_analysis_button:
-        if not question.strip():
-            st.warning("Veuillez entrer une question.")
-        else:
-            try:
-                # Génération d'une clé unique pour la question
-                q_hash = hashlib.md5(question.encode()).hexdigest()
-                # Préparation des métadonnées communes
-                metadata = {
-                    "mode": mode_value,
-                    "timestamp": datetime.now(pytz.timezone('Europe/Paris')).isoformat(),
-                    "model_used": f"mistral-{model_size}-latest",
-                    "include_legal_articles": include_legal_articles if mode_value == "parlementaire" else False,
-                    "legislature": None,
-                    "rubrique": None
-                }
-
-                # Filtrer les documents uploadés par score (seuil = 0.7)
-                min_score = 0.7
-                uploaded_docs_filtered = [
-                    res for res in response_data.get("uploaded_documents", [])
-                    if res.get("score", 0) >= min_score
-                ]
-
-                # Ajout à l'historique
-                st.session_state.full_historique[q_hash] = {
-                    "question": question,
-                    "response": response_data.get("response", "Pas de réponse générée"),
-                    "similar_documents": response_data.get("similar_documents", []),
-                    "legal_sources": response_data.get("legal_sources", []),
-                    "sources": response_data.get("sources", []),  # Pour le mode "analyse"
-                    "search_results": response_data.get("search_results", []),
-                    "uploaded_documents": uploaded_docs_filtered,
-                    "metadata": metadata
-                }
-                save_historique()  # Sauvegarde immédiate
-            except Exception as e:
-                st.error(f"Erreur lors de l'ajout à l'historique: {str(e)}")
-
-    # --- Affichage de l'historique complet ---
+    # Affichage de l'historique complet (votre code existant)
     st.markdown("""
     <style>
-        /* Centrage du bloc historique */
-        .history-container {
-            max-width: 1000px;
-            margin-left: auto;
-            margin-right: 0;
-            padding-left: 1rem;
-        }
-        /* Style des expanders */
-        .history-expander {
-            margin-bottom: 0.5rem !important;
-            border: 1px solid #e9ecef;
-            border-radius: 8px;
-        }
-        /* Espacement des éléments */
-        .history-entry {
-            margin-bottom: 1rem;
-        }
+        .history-container { max-width: 1000px; margin-left: auto; margin-right: 0; padding-left: 1rem; }
+        .history-expander { margin-bottom: 0.5rem !important; border: 1px solid #e9ecef; border-radius: 8px; }
+        .metadata-line { font-size: 0.8em; color: #666; margin-bottom: 0.5em; margin-top: 0.5em; }
     </style>
     """, unsafe_allow_html=True)
 
-    # Conteneur pour centrer à gauche
     with st.container():
         st.markdown('<div class="history-container">', unsafe_allow_html=True)
-
         if hasattr(st.session_state, 'full_historique') and st.session_state.full_historique:
             nb_entries = len(st.session_state.full_historique)
             st.markdown(
-                f"""
-                <div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;">
-                    <span style="font-size:18px;font-weight:bold;">🗂️ Historique des questions ({nb_entries})</span>
-                </div>
-                """,
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;">'
+                f'<span style="font-size:23px;font-weight:bold;">🗂️ Historique des réponses générées ({nb_entries})</span>'
+                f'</div>',
                 unsafe_allow_html=True
             )
 
@@ -3164,82 +3809,28 @@ else:
             )
 
             for idx, (q_hash, entry) in enumerate(sorted_historique):
+                metadata = entry.get("metadata", {})
+
+                custom_instructions = metadata.get('custom_instructions', '')
+                custom_instructions_display = f"Instructions: '{custom_instructions}'" if custom_instructions else "Instructions: Aucune"
+
+                metadata_str = (
+                    f"🕒 {metadata.get('timestamp', '')[:16].replace('T', ' ')} | "
+                    f"Mode: {metadata.get('mode', 'inconnu')} | "
+                    f"Modèle: {metadata.get('model_used', 'inconnu')} | "
+                    f"Orientation: {metadata.get('response_orientation', 'inconnu')} | "
+                    f"Articles juridiques: {'Oui' if metadata.get('include_legal_articles', False) else 'Non'} | "
+                    f"Longueur: {metadata.get('longueur', 'inconnu')} | "
+                    f"Détail juridique: {metadata.get('detail_juridique', 'inconnu')}/5 | "
+                    f"{custom_instructions_display}"
+                )
+
+                st.markdown(f'<div class="metadata-line">{metadata_str}</div>', unsafe_allow_html=True)
+
                 with st.expander(f"{idx+1}. {truncate_text(entry['question'], max_tokens=50)}", expanded=False):
-                    # Métadonnées
-                    metadata = entry.get("metadata", {})
-                    st.caption(
-                        f"🕒 {metadata.get('timestamp', '')[:16].replace('T', ' ')} "
-                        f"| Mode: {metadata.get('mode', 'inconnu')} "
-                        f"| Modèle: {metadata.get('model_used', 'inconnu')}"
-                    )
-
-                    # Question
                     st.markdown(f"**📝 Question:**\n{entry.get('question', 'Non disponible')}")
-
-                    # Réponse (sans duplication)
                     st.markdown(f"**💬 Réponse:**")
                     st.markdown(entry.get('response', 'Non disponible'))
-
-                    # --- Sources juridiques (si disponibles) ---
-                    if entry.get("legal_sources") or entry.get("sources"):
-                        with st.expander("⚖️ Articles juridiques"):
-                            if metadata.get("mode") == "analyse_juridique":  # Note : "analyse_juridique" (avec underscore)
-                                # Mode "Analyse juridique" : utilise "sources" et affiche l'arbre législatif
-                                if not entry.get("sources"):
-                                    st.info("Aucun article juridique enregistré.")
-                                else:
-                                    # Construction de l'arbre législatif
-                                    tree = {}
-                                    for source in entry["sources"]:
-                                        art = source["article"]
-                                        add_to_tree(tree, art, source)  # Utilise la fonction existante
-
-                                    # Affichage de l'arbre
-                                    render_tree(st, tree)  # Utilise la fonction existante
-
-                            else:  # Mode "Réponse parlementaire" : utilise "legal_sources"
-                                for art in entry.get("legal_sources", []):
-                                    with st.expander(f"Article {getattr(art, 'num', 'N/A')} ({getattr(art, 'collection', 'N/A')})"):
-                                        st.markdown(f"**Titre:** {getattr(art, 'titre', 'Non disponible')}")
-                                        st.markdown(f"**Texte:**\n{getattr(art, 'article_complet', 'Non disponible')}")
-
-                    # --- Résultats de recherche internet (si disponibles) ---
-                    if entry.get("search_results"):
-                        with st.expander("🌐 Résultats de recherche internet"):
-                            for item_idx, item in enumerate(entry["search_results"]):
-                                with st.expander(f"{item_idx+1}. {item.get('title', 'Sans titre')}"):
-                                    if item.get("url"):
-                                        st.markdown(f"[Lien]({item.get('url')})")
-                                    st.markdown(item.get("content") or item.get("snippet", "Aucun extrait disponible"))
-
-                    # --- Anciennes QE similaires (si disponibles) ---
-                    if entry.get("similar_documents"):
-                        with st.expander("🏛️ Questions parlementaires similaires"):
-                            for doc_idx, doc in enumerate(entry["similar_documents"]):
-                                with st.expander(f"QE {doc_idx+1} - Score: {getattr(doc, 'score', 'N/A'):.2f}"):
-                                    st.markdown(f"**Question:** {getattr(doc, 'question', 'Non disponible')}")
-                                    st.markdown(f"**Réponse:** {getattr(doc, 'reponse', 'Non disponible')}")
-
-                    # --- Résultats vectoriels sur documents uploadés ---
-                    if entry.get("uploaded_documents"):
-                        with st.expander("📄 Documents uploadés pertinents"):
-                            # Regrouper par document
-                            grouped = {}
-                            for res in entry["uploaded_documents"]:
-                                doc_name = res["collection"].split('__')[0].replace('_', ' ')
-                                grouped.setdefault(doc_name, []).append(res)
-
-                            for doc_name, results in grouped.items():
-                                with st.expander(f"📄 {doc_name} ({len(results)} extraits)"):
-                                    for idx_res, res in enumerate(results, start=1):
-                                        score = f"{res['score']:.2f}" if res.get("score") is not None else "N/A"
-                                        text_full = res["text"]  # ✅ affichage complet
-                                        title = res.get("title") or "N/A"
-
-                                        st.markdown(f"**Extrait {idx_res} (score: {score})**")
-                                        st.markdown(text_full)
-                                        st.markdown(f"**Section :** {title}")
-                                        st.markdown("---")
 
                     # Boutons d'action
                     col1, col2 = st.columns([1, 1])
@@ -3252,7 +3843,7 @@ else:
                         st.download_button(
                             label="⬇️ Exporter en TXT",
                             data=export_content.encode("utf-8"),
-                            file_name=f"export_{idx+1}_{metadata.get('mode', 'parlementaire')}.txt",
+                            file_name=f"export_{q_hash[:8]}_{metadata.get('mode', 'parlementaire')}.txt",
                             mime="text/plain",
                             key=f"export_hist_{q_hash}"
                         )
@@ -3262,7 +3853,103 @@ else:
                             save_historique()
                             st.rerun()
 
+                    # --- Sources juridiques (sans expander) ---
+                    if entry.get("legal_sources") or entry.get("sources"):
+                        st.markdown("### ⚖️ Articles juridiques")
+
+                        # Fonction pour afficher un article juridique
+                        def display_legal_article(article_data):
+                            if not isinstance(article_data, dict):
+                                st.warning(f"Structure inattendue: {type(article_data)}")
+                                return
+
+                            # Clés adaptées à la structure actuelle
+                            num = article_data.get("num", "N/A")
+                            collection = article_data.get("collection", "N/A")
+                            titre = article_data.get("titre", "Non disponible")
+                            texte = article_data.get("contenu", "Non disponible")
+                            contexte = article_data.get("contexte_hierarchique", "Non disponible")
+                            provenance = article_data.get("provenance", "initial")
+                            score = article_data.get("score")
+
+                            # Affichage "à plat" (sans expander)
+                            st.markdown(f"#### Article {num} ({collection})")
+                            st.markdown(f"**Titre:** {titre}")
+                            st.markdown(f"**Contexte hiérarchique:** {contexte}")
+                            if provenance == "initial" and score is not None:
+                                st.markdown(f"**Score:** {score:.3f}")
+                            st.markdown(f"**Texte:**\n{texte}")
+                            st.markdown("---")
+
+                        # Mode "analyse_juridique" (utilise "sources")
+                        if metadata.get("mode") == "analyse_juridique":
+                            sources = entry.get("sources", [])
+                            if not sources:
+                                st.info("Aucun article juridique enregistré.")
+                            else:
+                                # Regroupement par code juridique
+                                by_code = {}
+                                for art in sources:
+                                    code = art.get("collection", "Inconnu")
+                                    if code not in by_code:
+                                        by_code[code] = []
+                                    by_code[code].append(art)
+
+                                # Affichage par code
+                                for code, articles in by_code.items():
+                                    st.markdown(f"**Code: {code}**")
+                                    for art in articles:
+                                        display_legal_article(art)
+
+                        # Mode "Réponse parlementaire" (utilise "legal_sources")
+                        else:
+                            legal_sources = entry.get("legal_sources", [])
+                            if not legal_sources:
+                                st.info("Aucun article juridique disponible.")
+                            else:
+                                for article in legal_sources:
+                                    display_legal_article(article)
+
+                    # --- Résultats de recherche internet (sans expander) ---
+                    if entry.get("search_results"):
+                        st.markdown("### 🌐 Résultats de recherche internet")
+                        # Résumé global
+                        if entry.get("search_context") or entry.get("answer"):
+                            st.markdown(f"**Résumé :** {entry.get('search_context') or entry.get('answer')}")
+                        for item_idx, item in enumerate(entry["search_results"]):
+                            st.markdown(f"#### Résultat {item_idx+1}: {item.get('title', 'Sans titre')}")
+                            if item.get("url"):
+                                st.markdown(f"[Lien]({item.get('url')})")
+                            st.markdown(item.get("content") or item.get("snippet", "Aucun extrait disponible"))
+                            st.markdown("---")
+
+                    # --- Anciennes QE similaires (sans expander) ---
+                    if entry.get("similar_documents"):
+                        st.markdown("### 🏛️ Questions parlementaires similaires")
+                        for doc_idx, doc in enumerate(entry["similar_documents"]):
+                            st.markdown(f"#### QE {doc_idx+1} - Score: {getattr(doc, 'score', 'N/A'):.2f}")
+                            st.markdown(f"**Question:** {getattr(doc, 'question', 'Non disponible')}")
+                            st.markdown(f"**Réponse:** {getattr(doc, 'reponse', 'Non disponible')}")
+                            st.markdown("---")
+
+                    # --- Résultats vectoriels sur documents uploadés (sans expander) ---
+                    if entry.get("uploaded_documents"):
+                        st.markdown("### 📄 Documents uploadés pertinents")
+                        grouped = {}
+                        for res in entry["uploaded_documents"]:
+                            doc_name = res["collection"].split('__')[0].replace('_', ' ')
+                            grouped.setdefault(doc_name, []).append(res)
+                        for doc_name, results in grouped.items():
+                            st.markdown(f"#### {doc_name} ({len(results)} extraits)")
+                            for idx_res, res in enumerate(results, start=1):
+                                score = f"{res['score']:.2f}" if res.get("score") is not None else "N/A"
+                                text_full = res["text"]
+                                title = res.get("title") or "N/A"
+                                st.markdown(f"**Extrait {idx_res} (score: {score})**")
+                                st.markdown(text_full)
+                                st.markdown(f"**Section :** {title}")
+                                st.markdown("---")
+
         else:
             st.info("Aucune question enregistrée dans l'historique pour le moment.")
-
         st.markdown('</div>', unsafe_allow_html=True)

@@ -1,21 +1,23 @@
-altair
-pandas
+# --- QE Generator / Parlement RAG ---
+# Dépendances de la version du 14/12/2025 (app.py).
+# Cette version n'utilise PLUS `unstructured` / opencv / pytesseract
+# (contrairement à la version déployée en décembre) : la liste est donc courte.
+# Volontairement non figé pour laisser Streamlit Cloud résoudre pour sa version
+# de Python. À figer (pip freeze) une fois l'app stable.
+
 streamlit
-sentence-transformers
-transformers==4.36.2
-torch
-pyperclip
-python-docx
-python-dotenv
-qdrant-client==1.15.1
-pdfplumber
-matplotlib
-unstructured==0.10.30
-PyPDF2==3.0.1
-pdf2image
-opencv-python
-opencv-python-headless
-pytesseract
-unstructured_pytesseract
-unstructured-inference
+requests
 pytz
+python-dotenv
+pydantic
+
+# Embeddings (tire torch + transformers automatiquement)
+sentence-transformers
+
+# Base vectorielle
+qdrant-client
+
+# Extraction de documents (upload dans l'app)
+PyPDF2
+python-docx
+pdfplumber
