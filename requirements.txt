@@ -15,7 +15,7 @@ pydantic
 sentence-transformers
 
 # Base vectorielle
-qdrant-client
+qdrant-client==1.13.3
 
 # Extraction de documents (upload dans l'app)
 PyPDF2
