@@ -18,3 +18,4 @@ opencv-python-headless
 pytesseract
 unstructured_pytesseract
 unstructured-inference
+pytz
