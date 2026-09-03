@@ -1559,12 +1559,14 @@ def search_uploaded_documents(
             except Exception as e:
                 st.warning(f"Erreur sur {collection}: {e}")
 
-        # 4. Trie par score et limite les résultats ; on garde en plus les 2
-        #    meilleurs extraits de fiches de référence même s'ils sortent du top_k
-        #    (le seuil final min_score est assoupli pour eux dans le formatage).
+        # 4. Trie par score et limite les résultats ; on garde EN PLUS tous les
+        #    extraits de fiches de référence qui dépassent le seuil assoupli
+        #    (contenu curé, court et peu nombreux : on préfère tout injecter que
+        #    laisser un chiffre à jour hors du prompt). Plafond de sécurité : 8.
         all_results.sort(key=lambda x: (x["score"] is not None, x["score"]), reverse=True)
         top = all_results[:top_k]
-        fiches = [r for r in all_results if r.get("is_fiche")][:2]
+        fiches = [r for r in all_results
+                  if r.get("is_fiche") and (r.get("score") or 0) >= 0.45][:8]
         for r in fiches:
             if r not in top:
                 top.append(r)
@@ -2196,7 +2198,7 @@ def build_parlementary_response_prompt(
        - Ne développez jamais un sigle qui n'est pas explicité dans les contextes fournis ou dans le glossaire ci-dessous ; en cas de doute, conservez le sigle seul.
        - En cas de contradiction entre deux valeurs pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
        - Le contexte parlementaire fourni indique la date de chaque réponse : il peut s'agir de réponses anciennes. Ne présentez pas comme actuel un dispositif qui a pu évoluer depuis. Privilégiez systématiquement la stratégie et les textes les plus récents, et traitez une réponse de plusieurs années comme un historique, non comme l'état du droit en vigueur.
-       - Si les documents de référence contiennent une « fiche de référence » (chiffres-clés datés, texte de loi récent) : c'est la **source à privilégier** pour tout chiffre, montant, effectif, date d'entrée en vigueur, numéro de loi ou de décret, et pour la définition d'un sigle. En cas d'écart entre une fiche de référence et une autre source, retenez la fiche de référence.
+       - Si les documents de référence contiennent une « fiche de référence » (chiffres-clés datés, texte de loi récent) : c'est la **source à privilégier** pour tout chiffre, montant, effectif, date d'entrée en vigueur, numéro de loi ou de décret, et pour la définition d'un sigle. **Un chiffre donné par une fiche de référence remplace tout chiffre différent trouvé ailleurs — y compris dans le contexte parlementaire ou un rapport — qui est alors réputé périmé.** Si une fiche indique explicitement de ne pas citer une valeur, ne la citez pas.
 
     8. **Glossaire de référence (secteur social et médico-social)** — à n'utiliser que si le sigle apparaît dans la question ou dans un contexte fourni ; ne pas introduire ces notions si elles ne sont pas dans le sujet :
        AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques.
@@ -2508,8 +2510,8 @@ def generate_response(
             '<div class="status-message">📄 Recherche dans la base documentaire...</div>',
             unsafe_allow_html=True
         )
-        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=10)  # Limiter à 10 chunks max
-        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=0.7, max_docs=10)
+        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=10)  # + extraits de fiches de référence
+        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=0.7, max_docs=16)
 
         # Étape 4 : Recherche internet
         search_context = "Aucune recherche internet effectuée."
