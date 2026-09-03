@@ -1648,6 +1648,33 @@ def search_question_parlementaire(query: str, top_k: int = 5) -> List[ResponseDo
 
     return results
 
+# Repondération du contexte parlementaire par la récence.
+# Une réponse ministérielle de plusieurs années décrit un état du droit dépassé
+# (plans périmés, chiffres anciens). Le tri par similarité pure fait parfois
+# remonter une QE très proche mais ancienne, que le modèle recopie telle quelle.
+# On garde le tri par similarité pour l'affichage ("Anciennes QE") ; pour le
+# contexte injecté dans le prompt, on repondère : poids = similarité * facteur
+# de récence à décroissance exponentielle (demi-vie ci-dessous).
+RECENCY_HALF_LIFE_YEARS = 4.0
+
+def rerank_parliamentary_by_recency(
+    docs: List["ResponseDocument"],
+    now: Optional[datetime] = None,
+) -> List["ResponseDocument"]:
+    now = now or datetime.now()
+
+    def combined_score(doc) -> float:
+        d = safe_parse_date(getattr(doc, "date_reponse", None))
+        if d == datetime.min:
+            age_years = 5.0  # date inconnue : pénalité modérée
+        else:
+            age_years = max(0.0, (now - d).days / 365.25)
+        recency = 0.5 ** (age_years / RECENCY_HALF_LIFE_YEARS)
+        similarity = getattr(doc, "score", 0.0) or 0.0
+        return similarity * recency
+
+    return sorted(docs, key=combined_score, reverse=True)
+
 # Fonction qui extrait un ordre numérique à partir d'un label en chiffres romains
 ROMAN_MAP = {
     "I":1,"II":2,"III":3,"IV":4,"V":5,"VI":6,"VII":7,"VIII":8,"IX":9,"X":10,
@@ -2142,6 +2169,7 @@ def build_parlementary_response_prompt(
        - Ne désignez une loi, une ordonnance ou un décret par son numéro et sa date QUE si ce numéro apparaît dans l'un des contextes fournis ; sinon, employez une formulation générique ("la loi relative à ...", "le décret encadrant ...").
        - Ne développez jamais un sigle qui n'est pas explicité dans les contextes fournis ou dans le glossaire ci-dessous ; en cas de doute, conservez le sigle seul.
        - En cas de contradiction entre deux valeurs pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
+       - Le contexte parlementaire fourni indique la date de chaque réponse : il peut s'agir de réponses anciennes. Ne présentez pas comme actuel un dispositif qui a pu évoluer depuis. Privilégiez systématiquement la stratégie et les textes les plus récents, et traitez une réponse de plusieurs années comme un historique, non comme l'état du droit en vigueur.
 
     8. **Glossaire de référence (secteur social et médico-social)** — à n'utiliser que si le sigle apparaît dans la question ou dans un contexte fourni ; ne pas introduire ces notions si elles ne sont pas dans le sujet :
        AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques.
@@ -2407,12 +2435,14 @@ def generate_response(
                 '<div class="status-message">🏛️ Recherche dans la base des anciennes questions / réponses...</div>',
                 unsafe_allow_html=True
             )
-            similar_documents = search_question_parlementaire(question, top_k=5)
-            if similar_documents:
-                # Garder les 5 dans similar_documents, mais n'en utiliser que 3 pour le prompt
-                selected_docs = similar_documents[:3]
+            _pool = search_question_parlementaire(question, top_k=8)
+            similar_documents = _pool[:5]  # affichage : les 5 plus proches
+            if _pool:
+                # Contexte du prompt : 3 QE après repondération par la récence
+                # (une réponse ancienne ne doit pas dicter la réponse actuelle).
+                selected_docs = rerank_parliamentary_by_recency(_pool)[:3]
                 parliamentary_context = "\n\n".join(
-                    [f"Contexte parlementaire {i+1} (source: {doc.uid}):\n"
+                    [f"Contexte parlementaire {i+1} (source: {doc.uid}, réponse du {doc.date_reponse or 'date inconnue'}):\n"
                      f"Question: {doc.question}\nRéponse: {truncate_text(doc.reponse, max_tokens=TOKEN_LIMITS[current_model_size]['parliamentary_context'] // 3)}"
                      for i, doc in enumerate(selected_docs)]
                 )
