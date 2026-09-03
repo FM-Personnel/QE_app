@@ -1530,10 +1530,11 @@ def search_uploaded_documents(
         # 3. Recherche dans chaque collection-document
         for collection in doc_collections:
             try:
+                _is_fiche_coll = collection.lower().startswith("fiche_de_reference")
                 results = qdrant_client.search(
                     collection_name=collection,
                     query_vector=query_embedding,
-                    limit=top_k,
+                    limit=30 if _is_fiche_coll else top_k,  # fiche : on veut voir tous ses chunks
                     with_payload=True,
                     with_vectors=False,
                 )
@@ -1543,7 +1544,7 @@ def search_uploaded_documents(
                 # d'embedding est entraîné sur des QE, pas sur des fiches -> leurs
                 # scores bruts sont bas, d'où un bonus franc + une garantie de
                 # présence (cf. point 4).
-                is_fiche = collection.lower().startswith("fiche_de_reference")
+                is_fiche = _is_fiche_coll
                 for result in results:
                     payload = result.payload or {}
                     score = float(result.score) if hasattr(result, "score") else None
