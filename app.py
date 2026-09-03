@@ -1051,6 +1051,17 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 _UNIFIED_CODE_COLLECTION = "CodesJuridiques"
 _UNIFIED_HIER_FIELDS = ("section", "chapitre", "titre_structure", "sous_section")
 
+
+def _is_legal_infra_collection(name: str) -> bool:
+    """Collections d'infrastructure de la recherche juridique (vecteurs NOMMÉS
+    `dense`/`bm25`, ou sparse seul) : `CodesJuridiques` et les compagnes
+    `<Code>__bm25`. Elles ne sont PAS des « collections-documents » : un
+    `qdrant_client.search()` à vecteur simple s'y solde par un 400 « Not existing
+    vector name ». À exclure de `search_uploaded_documents` et des sélecteurs de
+    documents de l'UI.
+    """
+    return name == _UNIFIED_CODE_COLLECTION or name.endswith("__bm25")
+
 _QE_STOP = set("""
 le la les un une des du de d au aux et ou a l en dans sur pour par que qui quoi dont ou
 il elle ils elles on se sa son ses leur leurs ce cet cette ces est sont etre a ont
@@ -1698,7 +1709,9 @@ def search_uploaded_documents(
             "Code de la santé publique",
         }
         collections = qdrant_client.get_collections()
-        doc_collections = [col.name for col in collections.collections if col.name not in protected]
+        doc_collections = [col.name for col in collections.collections
+                           if col.name not in protected
+                           and not _is_legal_infra_collection(col.name)]
 
         # 2. Limite aux collections sélectionnées si spécifiées
         if selected_collections:
@@ -3107,6 +3120,7 @@ else:
             doc_collections = [
                 name for name in collection_names
                 if name not in protected_collections and "_" in name  # Ex: "MonDocument_2023"
+                and not _is_legal_infra_collection(name)
             ]
 
             if not doc_collections:
@@ -3600,6 +3614,7 @@ else:
                     col.name for col in collections.collections
                     if col.name not in {"Code_de_la_sécurité_sociale", "Code_du_travail", "CASF", "QuestionParlementaire", "Code_de_la_santé_publique"}
                     and "_" in col.name
+                    and not _is_legal_infra_collection(col.name)
                 ]
 
                 # Affiche les noms propres (sans timestamp)
