@@ -1537,15 +1537,18 @@ def search_uploaded_documents(
                     with_payload=True,
                     with_vectors=False,
                 )
-                # Léger bonus pour les "fiches de référence" curées (chiffres-clés
-                # datés, textes récents) : elles doivent primer sur un chunk de PAP
-                # ou de rapport ancien pour un chiffre ou une date.
+                # Bonus pour les "fiches de référence" curées (chiffres-clés datés,
+                # textes récents) : elles doivent primer sur un chunk de PAP ou de
+                # rapport ancien pour un chiffre, une date ou un sigle. Le modèle
+                # d'embedding est entraîné sur des QE, pas sur des fiches -> leurs
+                # scores bruts sont bas, d'où un bonus franc + une garantie de
+                # présence (cf. point 4).
                 is_fiche = collection.lower().startswith("fiche_de_reference")
                 for result in results:
                     payload = result.payload or {}
                     score = float(result.score) if hasattr(result, "score") else None
                     if score is not None and is_fiche:
-                        score = min(1.0, score + 0.08)
+                        score = min(1.0, score + 0.12)
                     all_results.append({
                         "collection": collection,
                         "text": payload.get("text", ""),
@@ -1556,9 +1559,16 @@ def search_uploaded_documents(
             except Exception as e:
                 st.warning(f"Erreur sur {collection}: {e}")
 
-        # 4. Trie par score et limite les résultats
+        # 4. Trie par score et limite les résultats ; on garde en plus les 2
+        #    meilleurs extraits de fiches de référence même s'ils sortent du top_k
+        #    (le seuil final min_score est assoupli pour eux dans le formatage).
         all_results.sort(key=lambda x: (x["score"] is not None, x["score"]), reverse=True)
-        return all_results[:top_k]
+        top = all_results[:top_k]
+        fiches = [r for r in all_results if r.get("is_fiche")][:2]
+        for r in fiches:
+            if r not in top:
+                top.append(r)
+        return top
 
     except Exception as e:
         st.error(f"Erreur de recherche dans les documents uploadés: {e}")
@@ -1581,8 +1591,13 @@ def format_uploaded_docs_by_relevance(
     if not uploaded_results:
         return ""
 
-    # Filtrer par score
-    filtered = [doc for doc in uploaded_results if doc.get("score", 0) >= min_score]
+    # Filtrer par score. Seuil assoupli pour les fiches de référence (contenu curé
+    # et daté, à faire remonter même quand le score brut du modèle reste modeste).
+    filtered = [
+        doc for doc in uploaded_results
+        if doc.get("score", 0) >= min_score
+        or (doc.get("is_fiche") and doc.get("score", 0) >= 0.45)
+    ]
 
     # Trier par score décroissant
     filtered.sort(key=lambda d: d.get("score", 0), reverse=True)
