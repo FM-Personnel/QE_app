@@ -2136,7 +2136,17 @@ def build_parlementary_response_prompt(
        - Toute réponse qui se termine par une phrase tronquée est incorrecte.
        - Toute réponse qui contient des listes ou des titres est incorrecte.
 
-    {f"7. Instructions spécifiques strictes : {custom_instructions}" if custom_instructions else ""}
+    7. **Exactitude — chiffres, dates et références (impératif)** :
+       - Ne citez un chiffre, un montant, un effectif, un pourcentage ou une date d'entrée en vigueur QUE s'il figure explicitement dans l'un des contextes fournis ci-dessus (contexte parlementaire, textes juridiques, documents de référence, recherche internet).
+       - À défaut, restez qualitatif ("un montant revalorisé chaque année", "plusieurs centaines de structures") plutôt que d'avancer une valeur non sourcée.
+       - Ne désignez une loi, une ordonnance ou un décret par son numéro et sa date QUE si ce numéro apparaît dans l'un des contextes fournis ; sinon, employez une formulation générique ("la loi relative à ...", "le décret encadrant ...").
+       - Ne développez jamais un sigle qui n'est pas explicité dans les contextes fournis ou dans le glossaire ci-dessous ; en cas de doute, conservez le sigle seul.
+       - En cas de contradiction entre deux valeurs pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
+
+    8. **Glossaire de référence (secteur social et médico-social)** — à n'utiliser que si le sigle apparaît dans la question ou dans un contexte fourni ; ne pas introduire ces notions si elles ne sont pas dans le sujet :
+       AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques.
+
+    {f"9. Instructions spécifiques strictes : {custom_instructions}" if custom_instructions else ""}
     [/INST]
     """
     return prompt
@@ -2796,14 +2806,25 @@ else:
         st.markdown("---")
 
         # Choix du modèle Mistral
-        model_size = st.radio(
+        _MODEL_LABELS = {
+            "Small": "small",
+            "Medium": "medium",
+            "Large (recommandé)": "large",
+        }
+        model_label = st.radio(
             "Choix du modèle Mistral",
-            ["Small", "Medium", "Large (recommandé)"],
-            index=0
+            list(_MODEL_LABELS.keys()),
+            index=0,
         )
 
-        # Normaliser la valeur pour l'appel API
-        model_size = model_size.lower()
+        # Normaliser pour l'appel API ("mistral-<taille>-latest") ET exposer dans
+        # st.session_state : c'est la SEULE source lue au moment de la génération
+        # (cf. `st.session_state.get('model_size', 'small')` plus bas). Sans cette
+        # ligne, le choix du modèle est ignoré et toutes les réponses sont
+        # générées en "small". `.lower()` seul donnait par ailleurs
+        # "large (recommandé)" au lieu de "large".
+        model_size = _MODEL_LABELS[model_label]
+        st.session_state["model_size"] = model_size
 
         # Choix du moteur de recherche
         search_engine = st.radio(
