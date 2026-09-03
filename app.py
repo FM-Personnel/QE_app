@@ -1537,13 +1537,21 @@ def search_uploaded_documents(
                     with_payload=True,
                     with_vectors=False,
                 )
+                # Léger bonus pour les "fiches de référence" curées (chiffres-clés
+                # datés, textes récents) : elles doivent primer sur un chunk de PAP
+                # ou de rapport ancien pour un chiffre ou une date.
+                is_fiche = collection.lower().startswith("fiche_de_reference")
                 for result in results:
                     payload = result.payload or {}
+                    score = float(result.score) if hasattr(result, "score") else None
+                    if score is not None and is_fiche:
+                        score = min(1.0, score + 0.08)
                     all_results.append({
                         "collection": collection,
                         "text": payload.get("text", ""),
-                        "score": float(result.score) if hasattr(result, "score") else None,
+                        "score": score,
                         "title": payload.get("section"),
+                        "is_fiche": is_fiche,
                     })
             except Exception as e:
                 st.warning(f"Erreur sur {collection}: {e}")
@@ -1588,10 +1596,13 @@ def format_uploaded_docs_by_relevance(
         source = doc.get("collection", "inconnu").replace("_", " ")
         title = doc.get("title", "") or ""
         score = doc.get("score", 0)
+        # Les fiches de référence sont denses en chiffres datés : on leur laisse un
+        # extrait plus long pour que la donnée utile ne soit pas coupée.
+        limit = 1400 if doc.get("is_fiche") else max_length
 
         formatted.append(
             f"Source: {source} (Section: {title})\n"
-            f"Passage: {passage[:max_length]}...\n"
+            f"Passage: {passage[:limit]}...\n"
             f"(Score: {score:.2f})\n"
         )
 
@@ -2170,6 +2181,7 @@ def build_parlementary_response_prompt(
        - Ne développez jamais un sigle qui n'est pas explicité dans les contextes fournis ou dans le glossaire ci-dessous ; en cas de doute, conservez le sigle seul.
        - En cas de contradiction entre deux valeurs pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
        - Le contexte parlementaire fourni indique la date de chaque réponse : il peut s'agir de réponses anciennes. Ne présentez pas comme actuel un dispositif qui a pu évoluer depuis. Privilégiez systématiquement la stratégie et les textes les plus récents, et traitez une réponse de plusieurs années comme un historique, non comme l'état du droit en vigueur.
+       - Si les documents de référence contiennent une « fiche de référence » (chiffres-clés datés, texte de loi récent) : c'est la **source à privilégier** pour tout chiffre, montant, effectif, date d'entrée en vigueur, numéro de loi ou de décret, et pour la définition d'un sigle. En cas d'écart entre une fiche de référence et une autre source, retenez la fiche de référence.
 
     8. **Glossaire de référence (secteur social et médico-social)** — à n'utiliser que si le sigle apparaît dans la question ou dans un contexte fourni ; ne pas introduire ces notions si elles ne sont pas dans le sujet :
        AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques.
