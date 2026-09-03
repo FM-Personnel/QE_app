@@ -20,6 +20,7 @@ from qdrant_client.http.models import Filter, FieldCondition, MatchValue, MatchT
 from typing import List, Optional, Union, Dict, Any, Literal, Set, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict
+from types import SimpleNamespace
 from PyPDF2 import PdfReader
 from docx import Document
 from urllib.parse import urlparse, parse_qs
@@ -225,6 +226,24 @@ def load_embedding_model():
         raise
 
 embedding_model = load_embedding_model()
+
+# --- Modèle BM25 sparse (recherche hybride sur la collection unifiée CodesJuridiques) ---
+# fastembed "Qdrant/bm25" : tokenisation + IDF, léger (pas de réseau de neurones).
+# Doit être appelé EXACTEMENT comme build_unified_codes.py (mêmes options par défaut)
+# pour que le vecteur sparse de la requête soit comparable à ceux indexés.
+@st.cache_resource
+def load_bm25_model():
+    try:
+        from fastembed import SparseTextEmbedding
+        m = SparseTextEmbedding("Qdrant/bm25")
+        list(m.query_embed("test"))  # force le téléchargement / la mise en cache
+        print("✅ Modèle BM25 (fastembed) chargé.")
+        return m
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ BM25 indisponible ({e}) — recherche juridique en mode vecteur seul.")
+        return None
+
+bm25_model = load_bm25_model()
 
 # --- Connexion à Qdrant ---
 try:
@@ -1013,6 +1032,156 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 
     return "\n".join(str(x) for x in lines)
 
+# =====================================================================
+# Recherche juridique unifiée (CodesJuridiques + fusion native Qdrant)
+# ---------------------------------------------------------------------
+# `CodesJuridiques` = les 4 codes en UNE collection Qdrant, avec un vecteur
+# dense (CamemBERT, réutilisé) ET un vecteur sparse BM25. Une seule requête
+# `points/query` fusionne (DBSF) trois sous-requêtes :
+#   1. dense (similarité cosinus) ;
+#   2. sparse BM25 (recouvrement lexical — rattrape l'article précis noyé
+#      parmi ses voisins de chapitre, mode de défaillance dominant du dense) ;
+#   3. dense restreint aux articles dont la hiérarchie (section / chapitre)
+#      matche le sujet de la question.
+# Mesuré sur le jeu qe-eval (18 cas) : legal_hit@8 0.78 -> 0.89, article
+# exact dans le top-8 0.35 -> 0.60. 1 requête au lieu de 4.
+# Repli automatique sur la recherche 4-collections si BM25 ou la collection
+# unifiée sont indisponibles.
+# =====================================================================
+_UNIFIED_CODE_COLLECTION = "CodesJuridiques"
+_UNIFIED_HIER_FIELDS = ("section", "chapitre", "titre_structure", "sous_section")
+
+_QE_STOP = set("""
+le la les un une des du de d au aux et ou a l en dans sur pour par que qui quoi dont ou
+il elle ils elles on se sa son ses leur leurs ce cet cette ces est sont etre a ont
+plus moins tres bien alors donc car ni or mais comme si aussi tout tous toute toutes
+gouvernement gouvernementale ministre ministere delegue deleguee depute deputee
+senateur senatrice parlementaire question ecrite orale attention appelle attire
+interroge interpelle alerte souhaite savoir connaitre demande concernant sujet
+monsieur madame mme mr etat france francais francaise afin egalement notamment ainsi
+cadre situation situations mesure mesures dispositif dispositions difficulte
+difficultes possibilite possibilites modalites modalite mise oeuvre place prise
+charge relative relatif relatives suite face lors entre leurs quelles quels quelle
+conditions condition reforme portant consequences consequence nombreux nombreuses
+nouveau nouvelle nouvelles souvent notre nos votre vos majoritairement constitues
+rencontrees rencontres actuellement recemment aujourd hui
+""".split())
+
+# Sigles du domaine -> forme longue (le code cite la forme longue, la QE le sigle)
+_QE_ACRONYMS = {
+    "rsa": "revenu de solidarite active",
+    "aah": "allocation aux adultes handicapes",
+    "apa": "allocation personnalisee d autonomie",
+    "pch": "prestation de compensation du handicap",
+    "ajpa": "allocation journaliere du proche aidant",
+    "ajap": "allocation journaliere d accompagnement d une personne en fin de vie",
+    "mdph": "maison departementale des personnes handicapees",
+    "ars": "agence regionale de sante",
+    "essms": "etablissements et services sociaux et medico sociaux",
+    "esms": "etablissements et services medico sociaux",
+    "ehpad": "hebergement pour personnes agees dependantes",
+    "ase": "aide sociale a l enfance",
+    "mna": "mineurs non accompagnes",
+    "cna": "conference nationale de l autonomie",
+    "cnsa": "caisse nationale de solidarite pour l autonomie",
+    "crip": "recueil des informations preoccupantes",
+    "aspa": "allocation de solidarite aux personnes agees",
+    "cmi": "carte mobilite inclusion",
+    "cti": "complement de traitement indiciaire remuneration medico social",
+    "segur": "revalorisation salariale professionnels sanitaire social medico social",
+}
+
+
+def _qe_norm(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.lower()
+
+
+def _qe_subject(question: str) -> str:
+    """Isole le sujet : une QE dit 'X interroge Y sur <SUJET>'. On coupe l'amorce."""
+    q = _qe_norm(question)
+    m = re.search(r"\b(?:sur|concernant|quant a|au sujet de|a propos de)\b", q[20:])
+    return q[20 + m.start():] if m else q
+
+
+def _qe_expand_acronyms(q: str) -> str:
+    for sig, long in _QE_ACRONYMS.items():
+        if re.search(rf"\b{sig}\b", q):
+            q += " " + long
+    return q
+
+
+def _qe_hierarchy_phrases(question: str, limit: int = 8) -> list:
+    """Bigrammes significatifs du sujet (pour le filtre plein texte sur la hiérarchie)."""
+    q = _qe_expand_acronyms(_qe_subject(question))
+    toks = [t for t in re.findall(r"[a-z0-9]+", q) if len(t) >= 4 and t not in _QE_STOP]
+    bigrams, seen, out = [f"{a} {b}" for a, b in zip(toks, toks[1:])], set(), []
+    for t in bigrams:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:limit]
+
+
+def _qe_question_sparse(question: str) -> Optional[dict]:
+    """Vecteur sparse BM25 du sujet de la question. None si BM25 indisponible."""
+    if bm25_model is None:
+        return None
+    try:
+        q = _qe_expand_acronyms(_qe_subject(question))
+        e = list(bm25_model.query_embed(q))[0]
+        return {"indices": [int(i) for i in e.indices], "values": [float(v) for v in e.values]}
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ BM25 requête échouée ({e}) — repli vecteur seul.")
+        return None
+
+
+def unified_code_search(question: str, dense_vec: list, limit: int) -> Optional[list]:
+    """Recherche juridique via `CodesJuridiques` + fusion native DBSF.
+
+    Renvoie une liste d'objets normalisés (`.payload` dict + `.score`) prête pour
+    `normalize_chunks`, ou `None` pour signaler qu'il faut retomber sur la
+    recherche 4-collections (BM25 absent, collection absente, ou erreur réseau).
+    """
+    sparse = _qe_question_sparse(question)
+    if sparse is None:
+        return None  # sans BM25, l'unifié n'apporte rien (mesuré) -> repli
+
+    prefetch = [
+        {"query": dense_vec, "using": "dense", "limit": max(40, limit * 4)},
+        {"query": sparse, "using": "bm25", "limit": max(40, limit * 4)},
+    ]
+    phrases = _qe_hierarchy_phrases(question)
+    if phrases:
+        should = [{"key": f, "match": {"text": p}}
+                  for p in phrases for f in _UNIFIED_HIER_FIELDS]
+        prefetch.append({"query": dense_vec, "using": "dense",
+                         "limit": max(40, limit * 4), "filter": {"should": should}})
+
+    body = {"prefetch": prefetch, "query": {"fusion": "dbsf"},
+            "limit": max(30, limit * 6), "with_payload": True}
+    try:
+        r = requests.post(
+            f"{QDRANT_URL.rstrip('/')}/collections/{_UNIFIED_CODE_COLLECTION}/points/query",
+            json=body, headers={"api-key": QDRANT_API_KEY, "content-type": "application/json"},
+            timeout=20)
+        if r.status_code == 404:
+            print(f"⚠️ Collection {_UNIFIED_CODE_COLLECTION} absente — repli 4-collections.")
+            return None
+        r.raise_for_status()
+        points = r.json().get("result", {}).get("points", [])
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ Recherche unifiée échouée ({e}) — repli 4-collections.")
+        return None
+
+    if not points:
+        return None  # rien remonté : laisser la recherche 4-collections tenter sa chance
+
+    return [SimpleNamespace(payload=p.get("payload", {}) or {}, score=p.get("score", 0.0))
+            for p in points]
+
+
 # Fonction qui recherche des articles juridiques dans les collections Qdrant en utilisant des embeddings
 def search_articles(
     query: str,
@@ -1044,23 +1213,35 @@ def search_articles(
         fused_query = " ".join(subqs) if subqs else query
         embedding = embedding_model.encode(fused_query).tolist()
 
-        all_results = []
-        for collection in valid_collections:
-            try:
-                hits = qdrant_client.search(
-                    collection_name=collection,
-                    query_vector=embedding,
-                    query_filter=query_filter,
-                    limit=limit * 2,  # on prend plus large pour filtrer ensuite
-                    with_payload=True,
-                    with_vectors=False
-                )
-                all_results.extend(hits)
-            except Exception:
-                continue
+        # --- 1 bis. Recherche unifiée (CodesJuridiques + fusion DBSF dense/BM25/hiérarchie) ---
+        # dense : vecteur des sous-questions fusionnées ; BM25 + filtre hiérarchie :
+        # sujet ré-isolé depuis la question brute (l'heuristique attend le texte de la QE).
+        unified_results = None if partie else unified_code_search(query, embedding, limit)
 
-        # --- 2. Filtrage par score ---
-        results = [r for r in all_results if r.score >= threshold]
+        if unified_results is not None:
+            if debug:
+                print(f"Recherche juridique : mode unifié ({len(unified_results)} candidats).")
+            # les scores DBSF ne sont pas des cosinus -> le seuil cosinus ne s'applique pas ;
+            # la fusion classe déjà par pertinence et seuls `limit` initiaux sont retenus (étape 6).
+            results = unified_results
+        else:
+            all_results = []
+            for collection in valid_collections:
+                try:
+                    hits = qdrant_client.search(
+                        collection_name=collection,
+                        query_vector=embedding,
+                        query_filter=query_filter,
+                        limit=limit * 2,  # on prend plus large pour filtrer ensuite
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    all_results.extend(hits)
+                except Exception:
+                    continue
+
+            # --- 2. Filtrage par score (cosinus) ---
+            results = [r for r in all_results if r.score >= threshold]
 
         # --- 3. Filtrage par mot-clé ---
         if must_contain:
