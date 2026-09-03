@@ -1239,14 +1239,14 @@ def search_articles(
             all_results = []
             for collection in valid_collections:
                 try:
-                    hits = qdrant_client.search(
+                    hits = qdrant_client.query_points(
                         collection_name=collection,
-                        query_vector=embedding,
+                        query=embedding,
                         query_filter=query_filter,
                         limit=limit * 2,  # on prend plus large pour filtrer ensuite
                         with_payload=True,
                         with_vectors=False
-                    )
+                    ).points
                     all_results.extend(hits)
                 except Exception:
                     continue
@@ -1725,13 +1725,13 @@ def search_uploaded_documents(
         for collection in doc_collections:
             try:
                 _is_fiche_coll = collection.lower().startswith("fiche_de_reference")
-                results = qdrant_client.search(
+                results = qdrant_client.query_points(
                     collection_name=collection,
-                    query_vector=query_embedding,
+                    query=query_embedding,
                     limit=30 if _is_fiche_coll else top_k,  # fiche : on veut voir tous ses chunks
                     with_payload=True,
                     with_vectors=False,
-                )
+                ).points
                 # Bonus pour les "fiches de référence" curées (chiffres-clés datés,
                 # textes récents) : elles doivent primer sur un chunk de PAP ou de
                 # rapport ancien pour un chiffre, une date ou un sigle. Le modèle
@@ -1823,13 +1823,13 @@ def format_uploaded_docs_by_relevance(
 # Fonction de recherches d'anciennes questions / réponses dans le RAG Qdrant
 def search_question_parlementaire(query: str, top_k: int = 5) -> List[ResponseDocument]:
     embedding = embedding_model.encode(query).tolist()
-    hits = qdrant_client.search(
+    hits = qdrant_client.query_points(
         collection_name="QuestionParlementaire",
-        query_vector=embedding,
+        query=embedding,
         limit=top_k,
         with_payload=True,
         with_vectors=False
-    )
+    ).points
     results: List[ResponseDocument] = []
 
     for i, r in enumerate(hits):

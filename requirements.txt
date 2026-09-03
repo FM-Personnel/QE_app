@@ -15,7 +15,8 @@ pydantic
 sentence-transformers
 
 # Base vectorielle
-# Figé : app.py utilise qdrant_client.search(), supprimé dans qdrant-client >= 1.14
+# Figé par prudence (version validée en prod). app.py utilise query_points()
+# (compatible >= 1.10) ; passer à une version plus récente demande un test complet.
 qdrant-client==1.13.3
 
 # Recherche juridique hybride : vecteur sparse BM25 de la requête pour la fusion
