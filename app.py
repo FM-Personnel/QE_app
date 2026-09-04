@@ -2013,6 +2013,130 @@ def annoter_qe_contexte(doc, now: Optional[datetime] = None) -> str:
             f"réponse du {getattr(doc, 'date_reponse', None) or 'date inconnue'})")
 
 
+# --- Recherche internet : bloc daté / sourcé + repérage des textes publiés (F1) ---
+# Avant : seuls les extraits bruts étaient injectés (ni titre, ni date, ni site),
+# le modèle ne pouvait pas voir qu'un résultat « JORF … Décret n° … » attestait
+# d'une parution — et écrivait « le Gouvernement travaille à l'élaboration d'un
+# décret » (cas #6491). Chaque résultat porte maintenant [date · site] + titre,
+# et un marqueur « TEXTE PUBLIÉ » quand le résultat donne un texte comme paru.
+_REF_TEXTE_RE = re.compile(
+    r"(?:d[ée]cret|arr[êe]t[ée]|loi|ordonnance)\s+n[°º]\s*\d{4}-\d+"
+    r"(?:\s+du\s+\d{1,2}(?:er)?\s+[a-zéû]+\s+\d{4})?",
+    re.IGNORECASE,
+)
+_PARUTION_RE = re.compile(r"JORF|Journal officiel|\bJO\s+(?:du|n[°º])", re.IGNORECASE)
+_A_VENIR_RE = re.compile(
+    r"projet de (?:d[ée]cret|loi|arr[êe]t[ée])|en pr[ée]paration|en cours d'[ée]laboration"
+    r"|consultation publique|sera publi[ée]",
+    re.IGNORECASE,
+)
+
+
+def detecter_texte_publie(titre: str, extrait: str) -> str:
+    """Référence du texte si le résultat atteste d'une parution, sinon ''.
+
+    Parution = mention JORF / Journal officiel, ou numéro attribué (« décret
+    n° 2025-897 du 4 septembre 2025 ») — un projet ou une consultation sans
+    numéro ne compte pas.
+    """
+    texte = f"{titre or ''} {extrait or ''}"
+    ref = _REF_TEXTE_RE.search(texte)
+    parution = _PARUTION_RE.search(texte)
+    if not ref and not parution:
+        return ""
+    if not ref and _A_VENIR_RE.search(texte):
+        return ""
+    return " ".join(ref.group(0).split()) if ref else parution.group(0)
+
+
+def _domaine_de(url: str) -> str:
+    m = re.match(r"https?://(?:www\.)?([^/]+)", url or "")
+    return m.group(1) if m else ""
+
+
+def _date_courte(date_str) -> str:
+    d = safe_parse_date(str(date_str)[:10]) if date_str else datetime.min
+    return d.strftime("%d/%m/%Y") if d != datetime.min else ""
+
+
+def annoter_resultat_internet(item: dict) -> str:
+    """En-tête d'un résultat : [date · site] [TEXTE PUBLIÉ · réf] titre."""
+    titre = (item.get("title") or "").strip()
+    extrait = item.get("content") or item.get("snippet") or ""
+    entete = " · ".join(b for b in (_date_courte(item.get("published_date") or item.get("date")),
+                                     _domaine_de(item.get("url") or item.get("link"))) if b)
+    ref = detecter_texte_publie(titre, extrait)
+    parts = [f"[{entete}]" if entete else "", f"[TEXTE PUBLIÉ · {ref}]" if ref else "", titre]
+    return " ".join(p for p in parts if p)
+
+
+def _cle_extrait(item: dict) -> str:
+    """Clé de dédoublonnage d'un résultat : extrait normalisé (160 premiers caractères)."""
+    extrait = (item.get("content") or item.get("snippet") or "").lower()
+    return re.sub(r"[^a-z0-9àâäéèêëïîôöùûüç]+", " ", extrait).strip()[:160]
+
+
+def filtrer_resultats_internet(results: list, question: str,
+                               min_commun: int = 2, min_garde: int = 2) -> tuple:
+    """F3 — écarte les résultats internet hors sujet et les doublons.
+
+    - doublons : même extrait normalisé (boilerplate « 8 nouveaux sites
+      universitaires » répété) → un seul conservé ;
+    - pertinence : nombre de termes saillants (≥ 4 lettres, hors mots vides)
+      communs entre la question et titre + extrait. Retenu si ≥ `min_commun` ;
+      si moins de `min_garde` résultats passent, on complète avec ceux qui ont
+      au moins 1 terme commun (meilleurs d'abord) ; un résultat sans aucun
+      terme commun n'est jamais retenu — sauf si AUCUN résultat n'en a (la
+      question n'a pas donné de termes exploitables : on garde les 3 premiers).
+
+    Renvoie (retenus dans l'ordre d'origine, nombre écartés).
+    """
+    results = list(results or [])
+    q_tokens = _tokens_saillants(question)
+    vus, uniques = set(), []
+    for r in results:
+        k = _cle_extrait(r)
+        if not k or k in vus:
+            continue
+        vus.add(k)
+        uniques.append(r)
+    scores = [len(q_tokens & _tokens_saillants(f"{r.get('title', '')} {r.get('content') or r.get('snippet') or ''}"))
+              for r in uniques]
+    if not any(scores):
+        kept = uniques[:3]
+    else:
+        kept = [r for r, s in zip(uniques, scores) if s >= min_commun]
+        if len(kept) < min_garde:
+            complement = sorted(
+                (r for r, s in zip(uniques, scores) if 0 < s < min_commun and r not in kept),
+                key=lambda r: -scores[uniques.index(r)],
+            )
+            kept += complement[:min_garde - len(kept)]
+            kept = [r for r in uniques if r in kept]  # ordre d'origine
+    return kept, len(results) - len(kept)
+
+
+def formater_recherche_internet(results: list, max_tokens_total: int,
+                                max_results: int = 15, answer: str = "") -> str:
+    """Bloc RECHERCHE INTERNET du prompt : un paragraphe daté/sourcé par résultat.
+
+    Lit `content` (Tavily, Google normalisé) ou `snippet` (brut) — l'ancien code
+    lisait `snippet` sur les résultats Google normalisés en `content` : le bloc
+    internet arrivait VIDE dans le prompt avec le moteur Google.
+    """
+    kept = [r for r in (results or [])[:max_results]
+            if (r.get("content") or r.get("snippet") or "").strip()]
+    per = max(40, max_tokens_total // max(1, len(kept)))
+    entries = [
+        f"Résultat {i} {annoter_resultat_internet(r)}\n"
+        f"{truncate_text((r.get('content') or r.get('snippet') or '').strip(), max_tokens=per)}"
+        for i, r in enumerate(kept, 1)
+    ]
+    if answer and answer.strip():
+        entries.insert(0, answer.strip())
+    return "\n\n".join(entries) if entries else "Aucun résultat internet exploitable."
+
+
 def rerank_parliamentary_by_recency(
     docs: List["ResponseDocument"],
     now: Optional[datetime] = None,
@@ -2046,6 +2170,48 @@ def extract_order(label: str) -> int:
     if m_num:
         return int(m_num.group(1))
     return float("inf")
+
+# --- F7 : situer chaque article dans son code pour borner sa portée ---
+# Avant : « Article L4321-14: <titre> » + contenu. Le modèle prenait l'article de
+# tête comme pertinent par construction et lui prêtait une portée générale
+# (« obligations déontologiques des professionnels de santé » pour un article du
+# chapitre des masseurs-kinésithérapeutes, #8922 ; « logements ET ERP » pour un
+# article sur les locaux d'habitation, #2891). On injecte maintenant le code et
+# la position (livre / titre / chapitre / section) avant le contenu.
+_NOMS_CODES = {
+    "CASF": "code de l'action sociale et des familles",
+    "Code_de_la_santé_publique": "code de la santé publique",
+    "Code_de_la_sécurité_sociale": "code de la sécurité sociale",
+    "Code_du_travail": "code du travail",
+}
+
+
+def _position_dans_le_code(contexte_hierarchique: str, niveaux: int = 3, max_len: int = 90) -> str:
+    """Derniers niveaux de la hiérarchie (hors « Partie … »), abrégés."""
+    parts = [p.strip() for p in (contexte_hierarchique or "").split(">") if p.strip()]
+    parts = [p for p in parts if not p.lower().startswith("partie")]
+    parts = parts[-niveaux:]
+    return " > ".join(p if len(p) <= max_len else p[:max_len - 1].rstrip() + "…" for p in parts)
+
+
+def formater_article_pour_prompt(art: dict, max_tokens: int) -> str:
+    """Bloc d'un article dans TEXTES JURIDIQUES APPLICABLES :
+
+        Article L4321-14 — code de la santé publique (Livre III : … > Chapitre Ier : Masseurs-kinésithérapeutes)
+        <titre>
+        <contenu tronqué>
+    """
+    code_brut = art.get("collection") or art.get("code") or ""
+    code = _NOMS_CODES.get(code_brut, code_brut).strip()
+    position = _position_dans_le_code(art.get("contexte_hierarchique", ""))
+    situation = code.lower() if code.lower().startswith("code") else code
+    if position:
+        situation = f"{situation} ({position})" if situation else f"({position})"
+    entete = f"Article {art.get('num', 'N/A')}" + (f" — {situation}" if situation else "")
+    titre = (art.get("titre") or "").strip()
+    contenu = truncate_text(art.get("contenu", "") or "", max_tokens=max_tokens)
+    return "\n".join(p for p in (entete, titre, contenu) if p)
+
 
 # Fonction qui tri les articles pour que la limite de tokens des prompts s'applique intelligemment
 def sort_articles_for_prompt(articles: List[dict]) -> List[dict]:
@@ -2390,6 +2556,7 @@ REGISTRE
 - Style administratif, formel, factuel, à la troisième personne (« Le Gouvernement… », « les services de l'État… »). Jamais de première personne, jamais de formule commerciale ni de politesse.
 - Prose continue uniquement : aucun titre, aucune puce, aucune liste, aucune numérotation. Les éléments multiples s'enchaînent en phrases complètes reliées par des connecteurs (« par ailleurs », « en outre », « à cet égard »).
 - Aucune redondance : ne répétez pas une idée déjà exprimée.
+- Le texte rendu est définitif : aucun crochet, aucun emplacement à compléter (« [montant] », « [à préciser] », « [mesures existantes] ») ne doit y subsister. Les crochets des consignes désignent un élément à remplacer par un fait tiré des contextes fournis ; s'il manque, la phrase est reformulée sans lui.
 - Terminez par une phrase de clôture réaffirmant l'engagement du Gouvernement, sans élargir à des sujets éloignés.
 
 EXACTITUDE (impératif — une erreur factuelle disqualifie la réponse)
@@ -2397,10 +2564,11 @@ EXACTITUDE (impératif — une erreur factuelle disqualifie la réponse)
 - N'écrivez jamais « loi n° AAAA-NNN », « décret n° AAAA-NNN », ni une référence d'article précise, si ce numéro exact ne figure pas dans un contexte fourni. Désignez alors le texte par son objet (« la loi relative à… », « le décret encadrant… », « un décret d'application est attendu »).
 - Ne développez jamais un sigle absent des contextes fournis et du glossaire ci-dessous ; dans le doute, conservez le sigle seul.
 - N'affirmez un lien juridique (« l'article X impose Y ») que si le texte fourni l'énonce clairement.
+- La portée d'un article est bornée par sa position dans le code, indiquée après son numéro (livre, titre, chapitre, section : profession, public ou type de locaux concernés). Ne l'étendez jamais au-delà : un article du chapitre des masseurs-kinésithérapeutes ne dit rien des autres professions de santé ; un article sur les locaux d'habitation ne dit rien des établissements recevant du public. Si aucun texte fourni ne recoupe le sujet de la question, n'en citez aucun et renvoyez au cadre général.
 - En cas de valeurs contradictoires pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
 - Le CONTEXTE PARLEMENTAIRE (réponses ministérielles antérieures) sert d'abord au registre, au ton et aux axes d'argumentation. Par défaut, n'en reprenez aucun chiffre, montant, effectif, pourcentage, date d'entrée en vigueur ni numéro de loi, de décret ou d'article : ces éléments y sont datés, donc présumés périmés — ils doivent alors provenir des TEXTES JURIDIQUES APPLICABLES, des DOCUMENTS DE RÉFÉRENCE ou de la RECHERCHE INTERNET.
 - EXCEPTION : lorsqu'une réponse ministérielle est marquée « TRAME FACTUELLE ADMISSIBLE » dans le contexte (proximité élevée, récente, même législature) et qu'elle traite le même texte ou le même dispositif que la question, vous pouvez en reprendre l'enchaînement des faits — succession des textes, décisions de justice, dates-clés, échéances — à trois conditions : (1) recouper chaque élément avec les TEXTES JURIDIQUES, les DOCUMENTS DE RÉFÉRENCE ou la RECHERCHE INTERNET ; (2) ne rien reprendre qu'une source plus récente contredit ; (3) ne pas présenter comme actuel un chiffre ou un état du droit que rien de récent ne confirme. Une réponse marquée « registre seulement » (ancienne ou autre législature) reste cantonnée au ton et aux axes.
-- Un texte (loi, décret, arrêté) que la RECHERCHE INTERNET ou un DOCUMENT DE RÉFÉRENCE donne comme **publié** — date de parution, référence au Journal officiel, numéro attribué — est publié : n'écrivez pas qu'il est « en préparation », « à venir », « à l'étude » ou que « le Gouvernement travaille à son élaboration ».
+- Un texte (loi, décret, arrêté) que la RECHERCHE INTERNET ou un DOCUMENT DE RÉFÉRENCE donne comme **publié** — date de parution, référence au Journal officiel, numéro attribué, entrée marquée « TEXTE PUBLIÉ » — est publié : n'écrivez pas qu'il est « en préparation », « à venir », « à l'étude » ou que « le Gouvernement travaille à son élaboration ».
 - Privilégiez systématiquement les textes et la stratégie les plus récents.
 - Si un document de référence est une « fiche de référence » (chiffres-clés datés, texte récent), c'est la source à privilégier pour tout chiffre, date, numéro de texte ou définition de sigle : une valeur de fiche remplace toute valeur différente trouvée ailleurs — y compris dans le contexte parlementaire ou un rapport — alors réputée périmée. Si une fiche indique de ne pas citer une valeur, ne la citez pas.
 
@@ -2520,17 +2688,18 @@ DEMANDES À TRAITER — traitez chacune, dans cet ordre. Si le contexte fourni n
 CONTEXTE PARLEMENTAIRE — réponses ministérielles antérieures à des questions proches. Registre, ton et axes d'argumentation. Une entrée marquée « TRAME FACTUELLE ADMISSIBLE » (proximité élevée, récente, même législature) et portant sur le même texte / dispositif que la question peut fournir l'enchaînement des faits, à recouper avec les autres contextes ; une entrée « registre seulement » n'apporte que le ton.
 {parliamentary_context}
 
-TEXTES JURIDIQUES APPLICABLES — prioritaires en cas de contradiction avec une autre source
+TEXTES JURIDIQUES APPLICABLES — prioritaires en cas de contradiction avec une autre source. Chaque article est situé dans son code (livre, titre, chapitre, section) : cette position borne sa portée. Un article qui ne recoupe pas le sujet de la question n'est pas à citer.
 {legal_context}
 
 DOCUMENTS DE RÉFÉRENCE
 {uploaded_documents}
 
-RECHERCHE INTERNET — actualités et positions du Gouvernement
+RECHERCHE INTERNET — actualités et positions du Gouvernement. Chaque résultat est daté et sourcé. Une entrée marquée « TEXTE PUBLIÉ » atteste que le texte visé est paru : tenez-le pour publié (et applicable à sa date d'entrée en vigueur), jamais pour « à venir » ou « en préparation ».
 {search_context}
 
 CONSIGNES DE RÉDACTION
 - Orientation : {orientation_mapping.get(response_orientation, "")}
+- Les crochets [ … ] des tournures ci-dessus sont des emplacements : remplacez-les par un élément des contextes fournis, ou reformulez la phrase sans eux. Aucun crochet ne doit subsister dans la réponse.
 - Avant de rédiger, repérez dans les contextes fournis les éléments qui répondent DIRECTEMENT à la question : texte applicable et sa succession, décision de justice, échéance, chiffre daté, position récente du Gouvernement. Construisez la réponse dessus. Ne restez pas au niveau général quand un contexte contient une réponse précise ; à l'inverse, si aucun contexte ne traite frontalement une demande, dites-le (sujet à l'étude, non tranché) sans meubler.
 - Corps de la réponse : rappel du cadre juridique et des chiffres disponibles, puis mesures en cours en privilégiant les plus récentes et l'année budgétaire courante. Intégrez les éléments des documents de référence puis de la recherche internet sans nommer la source.
 - N'annoncez pas d'échéance déjà passée à la date du jour.
@@ -2540,6 +2709,16 @@ CONSIGNES DE RÉDACTION
 {custom_line}
 PROJET DE RÉPONSE :"""
     return prompt
+
+# Placeholders laissés en clair (« [montant non précisé] ») : compté, pas retiré —
+# la boucle d'éval mesure l'effet du prompt, un nettoyage post-hoc le masquerait.
+_PLACEHOLDER_RE = re.compile(r"\[[^\]\n]{1,80}\]")
+
+
+def compter_placeholders(text: str) -> int:
+    """Nombre de fragments entre crochets laissés dans une réponse générée."""
+    return len(_PLACEHOLDER_RE.findall(text or ""))
+
 
 # Appelle l'API Mistral Large pour générer une réponse parlementaire
 def call_mistral_parliamentary_response(
@@ -2826,9 +3005,11 @@ def generate_response(
             if legal_sources:
                 legal_sources_for_prompt = sort_articles_for_prompt(legal_sources)
                 # Tronquer chaque article juridique
+                # F7 : chaque article est situé dans son code (portée bornée)
+                _par_article = TOKEN_LIMITS[current_model_size]['legal_context'] // len(legal_sources_for_prompt)
                 legal_context = "\n\n".join(
-                    [f"Article {art['num']}: {art['titre']}\n{truncate_text(art['contenu'], max_tokens=TOKEN_LIMITS[current_model_size]['legal_context'] // len(legal_sources_for_prompt))}"
-                     for art in legal_sources_for_prompt]
+                    formater_article_pour_prompt(art, _par_article)
+                    for art in legal_sources_for_prompt
                 )
 
         # Étape 3 : Recherche dans les documents uploadés
@@ -2856,24 +3037,20 @@ def generate_response(
 
             if search_engine == "Tavily":
                 results = search_tavily_government(extract_subject(question))
-                search_context = results.get("answer", "")
-                search_results = results.get("results", [])
-                if search_results:
-                    # Limiter à 15 snippets max pour le prompt
-                    truncated_snippets = [item.get("content", "") for item in search_results[:15]]
-                    search_context += "\n\n" + "\n\n".join(
-                        truncate_text(snippet, max_tokens=TOKEN_LIMITS[current_model_size]['search_context'] // 15)
-                        for snippet in truncated_snippets
-                    )
-            elif search_engine == "Google":
+            else:  # Google
                 results = search_google_government(extract_subject(question))
-                search_results = results.get("results", [])
-                # Limiter à 15 snippets max pour le prompt
-                truncated_snippets = [item.get("snippet", "") for item in search_results[:15]]
-                search_context = "\n\n".join(
-                    truncate_text(snippet, max_tokens=TOKEN_LIMITS[current_model_size]['search_context'] // 15)
-                    for snippet in truncated_snippets
-                )
+            # F3 : doublons et résultats hors sujet écartés (la liste filtrée est
+            # aussi celle affichée dans l'onglet — le modèle et l'utilisateur voient la même chose)
+            search_results, _ecartes = filtrer_resultats_internet(results.get("results", []), question)
+            # Bloc daté / sourcé, ≤ 15 résultats, marqueur « TEXTE PUBLIÉ » (F1)
+            search_context = formater_recherche_internet(
+                search_results,
+                TOKEN_LIMITS[current_model_size]['search_context'],
+                answer=results.get("answer", ""),
+            )
+            if _ecartes and len(search_results) < 3:
+                search_context += (f"\n\n(Peu de résultats pertinents : {_ecartes} résultat(s) "
+                                   "écarté(s) comme hors sujet ou en doublon.)")
 
         # Étape 5 : Génération de la réponse
         status_placeholder.markdown(
@@ -2921,7 +3098,8 @@ def generate_response(
             "detail_juridique": current_detail,
             "legislature": legislature,
             "rubrique": rubrique,
-            "custom_instructions": custom_instructions
+            "custom_instructions": custom_instructions,
+            "placeholders_restants": compter_placeholders(mistral_response),
         }
 
         return {
