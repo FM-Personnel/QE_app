@@ -100,6 +100,19 @@ st.set_page_config(
     layout="wide"   # ← élargit toute la page
 )
 
+# Moteur de recherche internet : détail d'implémentation, plus exposé dans l'UI.
+MOTEUR_RECHERCHE_INTERNET = "Google"  # "Google" | "Tavily"
+
+# Modèle Mistral : libellé affiché -> taille passée à l'API ("mistral-<taille>-latest").
+# Le sélecteur vit dans « Options avancées » (chemin parlementaire) ; ailleurs on
+# retombe sur MODELE_MISTRAL_DEFAUT.
+_MODEL_LABELS = {
+    "Large (recommandé)": "large",
+    "Medium": "medium",
+    "Small (rapide, moins fiable)": "small",
+}
+MODELE_MISTRAL_DEFAUT = "large"
+
 # --- Classe  CSS pour tous les messages de statut
 st.markdown("""
 <style>
@@ -1193,6 +1206,74 @@ def unified_code_search(question: str, dense_vec: list, limit: int) -> Optional[
             for p in points]
 
 
+# --- F2 : quand la question cite explicitement un n° d'article, le forcer dans le
+#     contexte (lookup direct) ; sinon, léger bonus lexical aux articles initiaux
+#     dont le titre / la hiérarchie recoupe les termes saillants de la question.
+_ARTICLE_CITE_RE = re.compile(
+    r"\b([LRD])\.?\s?(\d{1,4}(?:\s?-\s?\d{1,4}){0,4})\b(?!\s?\d)"
+)
+_STOPWORDS_FR = {
+    "les", "des", "une", "aux", "dans", "pour", "par", "sur", "avec", "sans", "sous",
+    "que", "qui", "quoi", "dont", "cette", "ces", "leur", "leurs", "est", "sont",
+    "être", "avoir", "plus", "moins", "entre", "vers", "chez", "afin", "lors",
+    "cadre", "code", "article", "articles", "loi", "décret", "arrêté", "situation",
+    "concernant", "relatif", "relative", "notamment", "ainsi", "cet",
+}
+
+
+def _norm_num(letter: str, digits: str) -> str:
+    return letter.upper() + re.sub(r"\s", "", digits)
+
+
+def extraire_articles_cites(text: str) -> list:
+    """N° d'articles de code explicitement cités dans la question (['R4311-11-1', 'L4331-1'])."""
+    out, seen = [], set()
+    for m in _ARTICLE_CITE_RE.finditer(text or ""):
+        num = _norm_num(m.group(1), m.group(2))
+        if num not in seen and re.search(r"\d", num):
+            seen.add(num)
+            out.append(num)
+    return out[:6]
+
+
+def lookup_articles_par_num(nums: list, collections: list, debug: bool = False) -> list:
+    """Récupère par filtre exact `num` chaque article cité (provenance='cited', score sentinelle haut)."""
+    found = []
+    for num in nums:
+        hit = None
+        for coll in collections:
+            try:
+                pts, _ = qdrant_client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(must=[FieldCondition(key="num", match=MatchValue(value=num))]),
+                    limit=1, with_payload=True, with_vectors=False,
+                )
+                if pts:
+                    hit = pts[0]
+                    break
+            except Exception:
+                continue
+        if hit is None:
+            if debug:
+                print(f"  article cité {num} : introuvable dans les codes")
+            continue
+        art = {**(hit.payload or {}), "provenance": "cited", "score": 3.0}
+        art.setdefault("collection", coll)
+        found.append(art)
+    return found
+
+
+def _tokens_saillants(text: str) -> set:
+    toks = re.findall(r"[a-zàâäéèêëïîôöùûüç]{4,}", (text or "").lower())
+    return {t for t in toks if t not in _STOPWORDS_FR}
+
+
+def _bonus_lexical(article: dict, q_tokens: set) -> float:
+    champ = f"{article.get('titre', '')} {article.get('contexte_hierarchique', '')}".lower()
+    a_tokens = _tokens_saillants(champ)
+    return min(0.4, 0.1 * len(q_tokens & a_tokens))
+
+
 # Fonction qui recherche des articles juridiques dans les collections Qdrant en utilisant des embeddings
 def search_articles(
     query: str,
@@ -1275,6 +1356,16 @@ def search_articles(
                 seen.add(art["num"])
                 unique_initials.append(art)
 
+        # --- 5 bis. F2 : articles cités dans la question + bonus lexical ---
+        articles_cites = extraire_articles_cites(query)
+        if not articles_cites:
+            # aucun n° cité : on reclasse les initiaux par recouvrement lexical
+            # (titre + hiérarchie) avec les termes saillants de la question.
+            q_tokens = _tokens_saillants(query)
+            for art in unique_initials:
+                base = art.get("score", 0) or 0
+                art["score"] = base + _bonus_lexical(art, q_tokens)
+
         # Tri par score ou numéro
         unique_initials.sort(key=lambda d: d.get("score", 0), reverse=True)
 
@@ -1294,8 +1385,20 @@ def search_articles(
                 seen.add(art["num"])
                 final_articles.append(art)
 
+        # --- 8 bis. F2 : forcer la présence des articles explicitement cités ---
+        if articles_cites:
+            for art in final_articles:
+                if art.get("num") in articles_cites:
+                    art["provenance"] = "cited"
+            manquants = [n for n in articles_cites if n not in seen]
+            if manquants:
+                forces = lookup_articles_par_num(manquants, valid_collections, debug=debug)
+                if debug and forces:
+                    print(f"Articles cités forcés dans le contexte : {[a.get('num') for a in forces]}")
+                final_articles = forces + final_articles
+
         # --- 9. Tri final ---
-        final_articles.sort(key=lambda d: d["num"])
+        final_articles.sort(key=lambda d: (d.get("provenance") != "cited", str(d.get("num", ""))))
 
         return {
             "sources": final_articles,
@@ -1880,6 +1983,36 @@ def search_question_parlementaire(query: str, top_k: int = 5) -> List[ResponseDo
 # de récence à décroissance exponentielle (demi-vie ci-dessous).
 RECENCY_HALF_LIFE_YEARS = 4.0
 
+# Législature en cours : sert à distinguer une QE antérieure « du même dossier »
+# (trame factuelle recoupable) d'une QE d'une mandature révolue (registre seul).
+LEGISLATURE_COURANTE = "17"
+_PROX_TRAME_MIN = 0.85          # proximité cosinus au-dessus de laquelle la trame est admissible
+_TRAME_AGE_MAX_ANNEES = 2.0     # et réponse de moins de 2 ans
+
+
+def _legislature_de(doc) -> Optional[str]:
+    leg = getattr(doc, "legislature", None)
+    if leg:
+        return str(leg).strip()
+    m = re.search(r"L(\d{1,2})", getattr(doc, "uid", "") or "")
+    return m.group(1) if m else None
+
+
+def annoter_qe_contexte(doc, now: Optional[datetime] = None) -> str:
+    """En-tête d'un bloc de contexte parlementaire : proximité + statut trame/registre (F1)."""
+    now = now or datetime.now()
+    score = getattr(doc, "score", None)
+    d = safe_parse_date(getattr(doc, "date_reponse", None))
+    age = None if d == datetime.min else max(0.0, (now - d).days / 365.25)
+    meme_leg = _legislature_de(doc) == LEGISLATURE_COURANTE
+    recente = age is not None and age <= _TRAME_AGE_MAX_ANNEES
+    admissible = (score or 0) >= _PROX_TRAME_MIN and meme_leg and recente
+    statut = "TRAME FACTUELLE ADMISSIBLE" if admissible else "registre seulement"
+    prox = f"proximité {score:.2f}" if isinstance(score, (int, float)) else "proximité n. d."
+    return (f"[{prox} · {statut}] (source: {getattr(doc, 'uid', '?')}, "
+            f"réponse du {getattr(doc, 'date_reponse', None) or 'date inconnue'})")
+
+
 def rerank_parliamentary_by_recency(
     docs: List["ResponseDocument"],
     now: Optional[datetime] = None,
@@ -1921,9 +2054,11 @@ def sort_articles_for_prompt(articles: List[dict]) -> List[dict]:
     1. Les articles initiaux (provenance="initial") par score décroissant.
     2. Les articles enrichis associés à chaque article initial, dans l'ordre des articles initiaux.
     """
-    # 1. Séparer les articles initiaux et enrichis
+    # 1. Séparer : articles cités dans la question (F2) > initiaux > enrichis
+    cited_articles = [art for art in articles if art.get("provenance") == "cited"]
     initial_articles = [art for art in articles if art.get("provenance") == "initial"]
-    enriched_articles = [art for art in articles if art.get("provenance") != "initial"]
+    enriched_articles = [art for art in articles
+                         if art.get("provenance") not in ("initial", "cited")]
 
     # 2. Trier les articles initiaux par score décroissant
     initial_articles_sorted = sorted(
@@ -1932,10 +2067,8 @@ def sort_articles_for_prompt(articles: List[dict]) -> List[dict]:
         reverse=True
     )
 
-    # 3. Ajouter les articles enrichis à la fin
-    sorted_articles = initial_articles_sorted + enriched_articles
-
-    return sorted_articles
+    # 3. Cités d'abord (ils répondent frontalement à la question), puis initiaux, puis enrichis
+    return cited_articles + initial_articles_sorted + enriched_articles
 
 # Construit un prompt pour Mistral Large afin de générer une analyse juridique.
 def build_legal_analysis_prompt(question: str, articles: List[dict], stats: dict) -> str:
@@ -2249,7 +2382,51 @@ def generate_legal_analysis(
         if 'old_stdout' in locals():
             sys.stdout = old_stdout
 
-# Construit le prompt d'appel à Mistral
+# Message `system` de la réponse parlementaire : rôle, registre, garde-fous
+# d'exactitude et glossaire — partie stable, réutilisée à chaque appel.
+SYSTEME_REPONSE_PARLEMENTAIRE = """Vous êtes rédacteur au sein d'un cabinet ministériel. Vous rédigez le projet de réponse à une question écrite (QE) d'un parlementaire, portant sur la sphère sociale et médico-sociale française. Le texte sera publié au Journal officiel.
+
+REGISTRE
+- Style administratif, formel, factuel, à la troisième personne (« Le Gouvernement… », « les services de l'État… »). Jamais de première personne, jamais de formule commerciale ni de politesse.
+- Prose continue uniquement : aucun titre, aucune puce, aucune liste, aucune numérotation. Les éléments multiples s'enchaînent en phrases complètes reliées par des connecteurs (« par ailleurs », « en outre », « à cet égard »).
+- Aucune redondance : ne répétez pas une idée déjà exprimée.
+- Terminez par une phrase de clôture réaffirmant l'engagement du Gouvernement, sans élargir à des sujets éloignés.
+
+EXACTITUDE (impératif — une erreur factuelle disqualifie la réponse)
+- Ne citez un chiffre, un montant, un effectif, un pourcentage ou une date d'entrée en vigueur QUE s'il figure explicitement dans l'un des contextes fournis autres que le contexte parlementaire (voir ci-dessous). À défaut, restez qualitatif (« un montant revalorisé chaque année », « plusieurs centaines de structures ») : n'avancez jamais une valeur non sourcée, même plausible.
+- N'écrivez jamais « loi n° AAAA-NNN », « décret n° AAAA-NNN », ni une référence d'article précise, si ce numéro exact ne figure pas dans un contexte fourni. Désignez alors le texte par son objet (« la loi relative à… », « le décret encadrant… », « un décret d'application est attendu »).
+- Ne développez jamais un sigle absent des contextes fournis et du glossaire ci-dessous ; dans le doute, conservez le sigle seul.
+- N'affirmez un lien juridique (« l'article X impose Y ») que si le texte fourni l'énonce clairement.
+- En cas de valeurs contradictoires pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
+- Le CONTEXTE PARLEMENTAIRE (réponses ministérielles antérieures) sert d'abord au registre, au ton et aux axes d'argumentation. Par défaut, n'en reprenez aucun chiffre, montant, effectif, pourcentage, date d'entrée en vigueur ni numéro de loi, de décret ou d'article : ces éléments y sont datés, donc présumés périmés — ils doivent alors provenir des TEXTES JURIDIQUES APPLICABLES, des DOCUMENTS DE RÉFÉRENCE ou de la RECHERCHE INTERNET.
+- EXCEPTION : lorsqu'une réponse ministérielle est marquée « TRAME FACTUELLE ADMISSIBLE » dans le contexte (proximité élevée, récente, même législature) et qu'elle traite le même texte ou le même dispositif que la question, vous pouvez en reprendre l'enchaînement des faits — succession des textes, décisions de justice, dates-clés, échéances — à trois conditions : (1) recouper chaque élément avec les TEXTES JURIDIQUES, les DOCUMENTS DE RÉFÉRENCE ou la RECHERCHE INTERNET ; (2) ne rien reprendre qu'une source plus récente contredit ; (3) ne pas présenter comme actuel un chiffre ou un état du droit que rien de récent ne confirme. Une réponse marquée « registre seulement » (ancienne ou autre législature) reste cantonnée au ton et aux axes.
+- Un texte (loi, décret, arrêté) que la RECHERCHE INTERNET ou un DOCUMENT DE RÉFÉRENCE donne comme **publié** — date de parution, référence au Journal officiel, numéro attribué — est publié : n'écrivez pas qu'il est « en préparation », « à venir », « à l'étude » ou que « le Gouvernement travaille à son élaboration ».
+- Privilégiez systématiquement les textes et la stratégie les plus récents.
+- Si un document de référence est une « fiche de référence » (chiffres-clés datés, texte récent), c'est la source à privilégier pour tout chiffre, date, numéro de texte ou définition de sigle : une valeur de fiche remplace toute valeur différente trouvée ailleurs — y compris dans le contexte parlementaire ou un rapport — alors réputée périmée. Si une fiche indique de ne pas citer une valeur, ne la citez pas.
+
+GLOSSAIRE (n'introduire ces notions que si elles figurent dans la question ou un contexte)
+AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques."""
+
+_MOIS_FR = ("", "janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+            "août", "septembre", "octobre", "novembre", "décembre")
+
+_DETAIL_JURIDIQUE = {
+    1: "Aucune référence juridique n'est requise.",
+    2: "Une seule phrase mentionne le cadre juridique général (ex. « Conformément au code de la sécurité sociale, … »).",
+    3: "Un paragraphe court (2-3 phrases) expose le cadre juridique applicable, en citant un article clé si pertinent.",
+    4: "Un paragraphe (4-5 phrases) analyse les implications juridiques, en citant explicitement deux à trois articles ou principes.",
+    5: "Une analyse complète (un à deux paragraphes) cite précisément tous les articles pertinents, leurs interactions et leurs implications concrètes pour la question posée.",
+}
+
+_LONGUEUR_MOTS = {
+    "Courte": "250 à 350 mots",
+    "Moyenne": "450 à 600 mots",
+    "Longue": "900 à 1200 mots",
+}
+
+
+# Construit le message `user` de l'appel à Mistral (le `system` est
+# SYSTEME_REPONSE_PARLEMENTAIRE, ajouté par call_mistral_parliamentary_response).
 def build_parlementary_response_prompt(
     question: str,
     parliamentary_context: str,
@@ -2259,10 +2436,13 @@ def build_parlementary_response_prompt(
     longueur: str,
     response_orientation: str,
     custom_instructions: str,
-    search_context: str
+    search_context: str,
+    subquestions: Optional[List[str]] = None,
 ) -> str:
     """
-    Construit un prompt optimisé avec contexte parlementaire ET juridique.
+    Construit le message `user` : question, contexte récupéré (parlementaire,
+    juridique, documentaire, web), demandes à traiter, et consignes propres à
+    la demande (orientation, détail juridique, longueur, instructions libres).
     """
     # Mapping des orientations de réponse
     orientation_mapping = {
@@ -2291,7 +2471,7 @@ def build_parlementary_response_prompt(
             "Évitez les formulations défensives comme 'nous ne pouvons pas' – préférez 'notre approche privilégie [solution], car [raison].'",
 
         "Répondre positivement aux propositions du parlementaire":
-            "Saluiez l'intérêt de la proposition **sans reprendre les critiques sous-jacentes**. "
+            "Saluez l'intérêt de la proposition **sans reprendre les critiques sous-jacentes**. "
             "Utilisez des formulations comme : "
             "'Votre proposition s'inscrit dans une dynamique que le Gouvernement partage, comme en attestent [mesures existantes].' "
             "'Nous partageons votre préoccupation pour [enjeu], et nos actions vont dans le sens de [objectif], comme le montre [exemple].' "
@@ -2306,101 +2486,59 @@ def build_parlementary_response_prompt(
             "Utilisez un vocabulaire neutre et des verbes d'action : 'le Gouvernement a engagé', 'les services travaillent à', 'les résultats montrent que'."
     }
 
-    # Longueur maximale selon le paramètre
-    max_tokens = 500 if longueur.startswith("Courte") else 1000 if longueur.startswith("Moyenne") else 2200
+    now = datetime.now(pytz.timezone("Europe/Paris"))
+    date_du_jour = f"{now.day} {_MOIS_FR[now.month]} {now.year}"
 
-    # Construction du prompt
-    prompt = f"""
-    [INST]
-    {orientation_mapping.get(response_orientation, "")}
+    detail = detail_juridique if detail_juridique in _DETAIL_JURIDIQUE else 3
+    detail_consigne = _DETAIL_JURIDIQUE[detail]
+    if detail >= 2:
+        detail_consigne += (" Ne citez le numéro d'un article que s'il figure dans les "
+                            "textes juridiques fournis ci-dessus ; sinon, renvoyez au code "
+                            "concerné sans numéro.")
 
-    **Question parlementaire :**
-    {question}
+    mots_cible = next((v for k, v in _LONGUEUR_MOTS.items() if longueur.startswith(k)),
+                      "450 à 600 mots")
 
-    **Contexte parlementaire (réponses similaires passées) :**
-    {parliamentary_context}
+    if subquestions:
+        demandes = "\n".join(f"{i}. {sq}" for i, sq in enumerate(subquestions, 1))
+    else:
+        demandes = "Déduire les demandes de la question elle-même."
 
-    **Textes juridiques applicables (PRIORITAIRES) :**
-    {legal_context}
+    custom_line = (
+        f"- Instruction spécifique impérative : {custom_instructions}\n"
+        if custom_instructions else ""
+    )
 
-    **Documents de référence uploadés (traités avec vos fonctions d'extraction) :**
-    {uploaded_documents}
+    prompt = f"""Nous sommes le {date_du_jour}.
 
-    **Résultats de recherche internet (actualités, positions du gouvernement) :**
-    {search_context}
+QUESTION DU PARLEMENTAIRE
+{question}
 
-    **Consignes strictes :**
-    1. **Priorité juridique** : Votre réponse DOIT être cohérente avec les textes juridiques fournis.
-       En cas de contradiction entre le contexte parlementaire et les textes juridiques, priorisez ces derniers.
-       En cas de contradiction entre le contexte parlementaire et les résultats de recherche internet, priorisez ces derniers.
-       Citez explicitement les articles pertinents (ex: "comme le précise l'article L124-5 du CASF...").
+DEMANDES À TRAITER — traitez chacune, dans cet ordre. Si le contexte fourni ne permet pas de répondre précisément à une demande, indiquez-le (renvoi au cadre général, mesure à l'étude, temporisation) — n'avancez jamais un chiffre, une date ou un texte non étayé pour combler.
+{demandes}
 
-    2. **Structure** :
-       - Introduisez le sujet sans insister sur les difficultés soulevées par le parlementaire, surtout si elles sont critiques quant à l'action du Gouvernement
-       - Rappelez éventuellement les chiffres et le cadre juridique
-       - Poursuivez avec les éléments budgétaires, prioritairement ceux qui concernent l'année en cours
-       - Intégrez les informations issues prioritairement des documents de référence uploadés puis de la recherche internet de manière fluide, sans mention explicite de la source ("recherche internet", "résultats de recherche") pour :
-            - décrivez les mesures prises par le Gouvernement et celles sur lesquelles le Gouvernement travaille
-            - précisez la position du Gouvernement sur les questions posées par le parlementaire
-            - insistez sur les décisions et les actions du Gouvernement les plus récentes
-       - N'annoncez pas d'échéances à venir pour des dates antérieures à la date du jour (exemple à éviter : "Une concertation sera menée d’ici l’été 2024" alors que nous sommes en novembre 2025)
-       - Concluez en réaffirmant l'engagement du Gouvernement.
-       - Ne mélangez pas le sujet à d'autres sujets trop éloignés dans la conclusion.
+CONTEXTE PARLEMENTAIRE — réponses ministérielles antérieures à des questions proches. Registre, ton et axes d'argumentation. Une entrée marquée « TRAME FACTUELLE ADMISSIBLE » (proximité élevée, récente, même législature) et portant sur le même texte / dispositif que la question peut fournir l'enchaînement des faits, à recouper avec les autres contextes ; une entrée « registre seulement » n'apporte que le ton.
+{parliamentary_context}
 
-    3. **Niveau de détail juridique** :
-    Le niveau de détail juridique demandé est de {detail_juridique}/5.
-    Respectez strictement les consignes suivantes en fonction de ce niveau :
-    - **Niveau 1** : Aucune référence juridique n'est obligatoire.
-    - **Niveau 2** : Une seule phrase doit mentionner le cadre juridique général (ex: "Conformément au Code de la sécurité sociale, ...").
-    - **Niveau 3** : Un paragraphe court (2-3 phrases) doit expliquer le cadre juridique applicable, en citant un article clé si pertinent.
-    - **Niveau 4** : Un paragraphe détaillé (4-5 phrases) doit analyser les implications juridiques, en citant explicitement 2-3 articles ou principes juridiques.
-    - **Niveau 5** : Une analyse juridique complète (1-2 paragraphes) est requise, avec citations précises de tous les articles pertinents, leurs interactions, et leurs implications concrètes pour la question posée.
+TEXTES JURIDIQUES APPLICABLES — prioritaires en cas de contradiction avec une autre source
+{legal_context}
 
-    4. **Longueur et ajustement dynamique** :
-       - Limite absolue : {max_tokens} tokens.
-       - Avant de finaliser, estimez le nombre de tokens de votre réponse.
-       - Si vous dépassez {max_tokens} :
-            - Supprimez les exemples, les répétitions ou les données secondaires.
-            - Conservez impérativement : l’enjeu, le cadre juridique, et la conclusion.
-            - Utilisez des formulations comme : "Pour respecter la limite, nous synthétisons les points clés :"
-       - Si la réponse risque d’être trop courte, développez le cadre juridique ou les mesures en cours.
+DOCUMENTS DE RÉFÉRENCE
+{uploaded_documents}
 
-    5. **Estimation préalable** :
-       - Un paragraphe = ~100 tokens. Adaptez le nombre de paragraphes en conséquence.
-       - Après chaque section, vérifiez que le total reste inférieur à {max_tokens}.
+RECHERCHE INTERNET — actualités et positions du Gouvernement
+{search_context}
 
-    6. **Style** :
-       - Utilisez un style administratif, formel et concis, comme dans les réponses ministérielles.
-       - Soyez précis, évitez absolument les généralités.
-       - La réponse doit être rédigée en prose continue, sans titres, sans puces, sans numérotation.
-       - Répondez précisément aux questions posées, par exemple sur les éléments budgétaires ou de calendrier.
-       - La réponse doit être d'actualité et privilégier les informations les plus récentes.
-       - Si les propositions faites par le parlementaire sont intéressantes, dites qu'elles seront étudiées.
-       - Utilisez uniquement des paragraphes rédigés, comme dans les réponses ministérielles publiées au Journal Officiel.
-       - Si vous avez plusieurs éléments à présenter, intégrez-les dans des phrases complètes reliées par des connecteurs ("par ailleurs", "en outre", "de plus").
-       - Les éléments de la réponse ne doivent pas être redondants.
-       - Ne pas mettre de formule de politesse à la fin.
-       - **Contrainte de longueur absolue** : La réponse ne doit pas dépasser {longueur}.
-       - Toute réponse plus longue sera rejetée.
-       - Si le sujet est trop complexe pour tenir dans cette limite, concentrez-vous sur les points les plus importants.
-       - Toute réponse qui se termine par une phrase tronquée est incorrecte.
-       - Toute réponse qui contient des listes ou des titres est incorrecte.
-
-    7. **Exactitude — chiffres, dates et références (impératif)** :
-       - Ne citez un chiffre, un montant, un effectif, un pourcentage ou une date d'entrée en vigueur QUE s'il figure explicitement dans l'un des contextes fournis ci-dessus (contexte parlementaire, textes juridiques, documents de référence, recherche internet).
-       - À défaut, restez qualitatif ("un montant revalorisé chaque année", "plusieurs centaines de structures") plutôt que d'avancer une valeur non sourcée.
-       - Ne désignez une loi, une ordonnance ou un décret par son numéro et sa date QUE si ce numéro apparaît dans l'un des contextes fournis ; sinon, employez une formulation générique ("la loi relative à ...", "le décret encadrant ...").
-       - Ne développez jamais un sigle qui n'est pas explicité dans les contextes fournis ou dans le glossaire ci-dessous ; en cas de doute, conservez le sigle seul.
-       - En cas de contradiction entre deux valeurs pour une même donnée, retenez celle de la source la plus récente et précisez sa date.
-       - Le contexte parlementaire fourni indique la date de chaque réponse : il peut s'agir de réponses anciennes. Ne présentez pas comme actuel un dispositif qui a pu évoluer depuis. Privilégiez systématiquement la stratégie et les textes les plus récents, et traitez une réponse de plusieurs années comme un historique, non comme l'état du droit en vigueur.
-       - Si les documents de référence contiennent une « fiche de référence » (chiffres-clés datés, texte de loi récent) : c'est la **source à privilégier** pour tout chiffre, montant, effectif, date d'entrée en vigueur, numéro de loi ou de décret, et pour la définition d'un sigle. **Un chiffre donné par une fiche de référence remplace tout chiffre différent trouvé ailleurs — y compris dans le contexte parlementaire ou un rapport — qui est alors réputé périmé.** Si une fiche indique explicitement de ne pas citer une valeur, ne la citez pas.
-
-    8. **Glossaire de référence (secteur social et médico-social)** — à n'utiliser que si le sigle apparaît dans la question ou dans un contexte fourni ; ne pas introduire ces notions si elles ne sont pas dans le sujet :
-       AJPA = allocation journalière du proche aidant ; APA = allocation personnalisée d'autonomie ; AVA = assurance vieillesse des aidants ; PCH = prestation de compensation du handicap ; MDPH = maison départementale des personnes handicapées ; MDA = maison départementale de l'autonomie ; CNSA = Caisse nationale de solidarité pour l'autonomie ; PFR = plateforme d'accompagnement et de répit ; GIR = groupe iso-ressources ; CMI = carte mobilité inclusion ; RQTH = reconnaissance de la qualité de travailleur handicapé ; ESMS = établissements et services sociaux et médico-sociaux ; IGAS = Inspection générale des affaires sociales ; DREES = direction de la recherche, des études, de l'évaluation et des statistiques.
-
-    {f"9. Instructions spécifiques strictes : {custom_instructions}" if custom_instructions else ""}
-    [/INST]
-    """
+CONSIGNES DE RÉDACTION
+- Orientation : {orientation_mapping.get(response_orientation, "")}
+- Avant de rédiger, repérez dans les contextes fournis les éléments qui répondent DIRECTEMENT à la question : texte applicable et sa succession, décision de justice, échéance, chiffre daté, position récente du Gouvernement. Construisez la réponse dessus. Ne restez pas au niveau général quand un contexte contient une réponse précise ; à l'inverse, si aucun contexte ne traite frontalement une demande, dites-le (sujet à l'étude, non tranché) sans meubler.
+- Corps de la réponse : rappel du cadre juridique et des chiffres disponibles, puis mesures en cours en privilégiant les plus récentes et l'année budgétaire courante. Intégrez les éléments des documents de référence puis de la recherche internet sans nommer la source.
+- N'annoncez pas d'échéance déjà passée à la date du jour.
+- Si une proposition du parlementaire est pertinente, indiquez qu'elle sera étudiée.
+- Niveau de détail juridique : {detail}/5. {detail_consigne}
+- Longueur cible : {mots_cible}. Si le sujet ne tient pas dans cette limite, concentrez-vous sur l'enjeu, le cadre juridique et la conclusion. Ne rendez jamais une réponse qui s'achève sur une phrase tronquée.
+{custom_line}
+PROJET DE RÉPONSE :"""
     return prompt
 
 # Appelle l'API Mistral Large pour générer une réponse parlementaire
@@ -2420,8 +2558,8 @@ def call_mistral_parliamentary_response(
     model_name = f"mistral-{model_size}-latest"
     max_tokens = 500 if longueur.startswith("Courte") else 1000 if longueur.startswith("Moyenne") else 2200
 
-    # Vérifier la taille du prompt
-    prompt_tokens = estimate_tokens(prompt)
+    # Vérifier la taille du prompt (système + utilisateur)
+    prompt_tokens = estimate_tokens(SYSTEME_REPONSE_PARLEMENTAIRE + prompt)
     max_allowed_prompt_tokens = 32000 if model_size == "large" else 16000
 
     if prompt_tokens > max_allowed_prompt_tokens:
@@ -2429,7 +2567,10 @@ def call_mistral_parliamentary_response(
 
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": SYSTEME_REPONSE_PARLEMENTAIRE},
+            {"role": "user", "content": prompt},
+        ],
         "temperature": 0.3,
         "max_tokens": max_tokens
     }
@@ -2474,27 +2615,16 @@ def handle_truncated_response(response: str, question: str, longueur: str) -> st
     else:
         incomplete_part = response[-100:]
 
-    completion_prompt = f"""
-    [INST]
-    Complétez UNIQUEMENT la phrase ou le paragraphe suivant en cours, sans ajouter de titre ni d'introduction.
-    Contexte original: {question[:200]}...
-    Texte à compléter: "{incomplete_part}"
-    Consignes strictes:
-    - Continuez directement le texte existant, sans recommencer la réponse.
-    - N'ajoutez pas de formule comme "Réponse du ministère...".- Terminez la phrase/paragraphe en cours de manière cohérente.
-    - Ajoutez une conclusion sur le thème de la question en 1-2 phrases maximum.
-    - Utilisez un style administratif et formel, comme dans les réponses ministérielles.
-    - Respectez strictement la limite de 400 caractères.
-    - Tout complément de réponse plus long sera rejeté.
-    - Concluez en réaffirmant l'engagement du Gouvernement.
-    - La réponse doit être rédigée en prose continue, sans titres, sans puces, sans numérotation.
-    - Utilisez uniquement des paragraphes rédigés, comme dans les réponses ministérielles publiées au Journal Officiel.
-    - Si vous avez plusieurs éléments à présenter, intégrez-les dans des phrases complètes reliées par des connecteurs ("par ailleurs", "en outre", "de plus").
-    - Ne pas mettre de formule de politesse à la fin.
-    - Tout complément de réponse qui se termine par une phrase tronquée est incorrecte.
-    - Toute complément de réponse qui contient des listes ou des titres est incorrecte.
-    [/INST]
-    """
+    completion_prompt = f"""Complétez UNIQUEMENT la phrase ou le paragraphe en cours, sans titre ni introduction, sans recommencer la réponse.
+
+Sujet de la question : {question[:200]}...
+Texte à compléter : "{incomplete_part}"
+
+Consignes :
+- Continuez directement le texte existant et terminez la phrase ou le paragraphe de manière cohérente.
+- Ajoutez au plus 1 à 2 phrases de conclusion réaffirmant l'engagement du Gouvernement.
+- Style administratif et formel, prose continue (aucun titre, aucune puce, aucune liste), comme au Journal officiel.
+- 400 caractères maximum. Pas de formule de politesse. Ne terminez pas sur une phrase tronquée."""
 
     try:
         completion_response = requests.post(
@@ -2665,8 +2795,9 @@ def generate_response(
                 # Contexte du prompt : 3 QE après repondération par la récence
                 # (une réponse ancienne ne doit pas dicter la réponse actuelle).
                 selected_docs = rerank_parliamentary_by_recency(_pool)[:3]
+                _now = datetime.now()
                 parliamentary_context = "\n\n".join(
-                    [f"Contexte parlementaire {i+1} (source: {doc.uid}, réponse du {doc.date_reponse or 'date inconnue'}):\n"
+                    [f"Contexte parlementaire {i+1} {annoter_qe_contexte(doc, _now)}:\n"
                      f"Question: {doc.question}\nRéponse: {truncate_text(doc.reponse, max_tokens=TOKEN_LIMITS[current_model_size]['parliamentary_context'] // 3)}"
                      for i, doc in enumerate(selected_docs)]
                 )
@@ -2750,6 +2881,13 @@ def generate_response(
             unsafe_allow_html=True
         )
 
+        # Sous-questions explicitées, injectées comme « demandes à traiter »
+        # (garantit qu'aucune sous-question n'est laissée sans réponse).
+        try:
+            subquestions_prompt = extract_subquestions(question)
+        except Exception:
+            subquestions_prompt = []
+
         prompt = build_parlementary_response_prompt(
             question=truncate_text(question, max_tokens=TOKEN_LIMITS[current_model_size]['question']),
             parliamentary_context=parliamentary_context,
@@ -2759,7 +2897,8 @@ def generate_response(
             longueur=current_longueur,
             response_orientation=current_orientation,
             custom_instructions=custom_instructions,
-            search_context=search_context
+            search_context=search_context,
+            subquestions=subquestions_prompt,
         )
 
         mistral_response = call_mistral_parliamentary_response(
@@ -2999,97 +3138,38 @@ else:
 
     with st.sidebar:
 
-        # Bouton Déconnexion
-        if st.button('Déconnexion', key="logout"):
-            st.session_state.authentication_status = None
-            st.rerun()
-
-        # Message de bienvenue
+        # Message de bienvenue + version
         st.write(f'Bienvenue *{st.session_state["name"]}*')
-    
-        # --- Version du site ---
-        st.markdown(
-            """
-            <style>
-            .version-text {
-                position: absolute;
-                top: 5px;
-                left: 0px;
-                color: #555;
-                font-size: 14px;
-                font-style: italic;
-            }
-            </style>
-            <div class="version-text">Version v0.1.12 (Beta)</div>
-            """,
-            unsafe_allow_html=True
-        )   
+        st.caption("Version v0.1.12 (Beta)")
 
-        # Séparateur visuel
         st.markdown("---")
 
-        # Paramètres de mode
+        # Choix du module
         mode = st.radio(
             "Choix du module",
             ["Réponse parlementaire", "Base documentaire", "Analyse juridique"], # Ajouter , "Analyse juridique" pour avoir le second mode - Permet de moduler les modes accessibles sur le site
             index=0
         )
 
-        # Conteneur pour contrôler la largeur du bouton
-        button_container = st.container()
-        # Initialisation des boutons à False
-        generate_parliamentary_button = False
-        generate_analysis_button = False
-        with button_container:
-            if mode == "Réponse parlementaire":
-                generate_parliamentary_button = st.button(
-                    "Générer la réponse",
-                    type="primary",
-                    key="generate_parliamentary_button"
-                    # Sans use_container_width pour une largeur automatique
-                )
-            elif mode == "Analyse juridique":
-                generate_analysis_button = st.button(
-                    "Générer l'analyse",
-                    type="primary",
-                    key="generate_analysis_button"
-                    # Sans use_container_width pour une largeur automatique
-                )
-        
-        # Ajoutez une séparation visuelle supplémentaire
+        # Moteur de recherche internet : fixé en conf (MOTEUR_RECHERCHE_INTERNET),
+        # ce n'est plus un choix exposé à l'utilisateur.
+        st.session_state["search_engine"] = MOTEUR_RECHERCHE_INTERNET
+        # Modèle Mistral : défaut ; le sélecteur est dans « Options avancées »
+        # (chemin parlementaire). Seule source lue à la génération.
+        st.session_state.setdefault("model_size", MODELE_MISTRAL_DEFAUT)
+
         st.markdown("---")
 
-        # Choix du modèle Mistral
-        _MODEL_LABELS = {
-            "Small": "small",
-            "Medium": "medium",
-            "Large (recommandé)": "large",
-        }
-        model_label = st.radio(
-            "Choix du modèle Mistral",
-            list(_MODEL_LABELS.keys()),
-            index=0,
-        )
+        # Déconnexion (en bas de la sidebar)
+        if st.button('Déconnexion', key="logout"):
+            st.session_state.authentication_status = None
+            st.rerun()
 
-        # Normaliser pour l'appel API ("mistral-<taille>-latest") ET exposer dans
-        # st.session_state : c'est la SEULE source lue au moment de la génération
-        # (cf. `st.session_state.get('model_size', 'small')` plus bas). Sans cette
-        # ligne, le choix du modèle est ignoré et toutes les réponses sont
-        # générées en "small". `.lower()` seul donnait par ailleurs
-        # "large (recommandé)" au lieu de "large".
-        model_size = _MODEL_LABELS[model_label]
-        st.session_state["model_size"] = model_size
-
-        # Choix du moteur de recherche
-        search_engine = st.radio(
-            "Moteur de recherche internet",
-            ["Google", "Tavily"],
-            index=0
-        )
-        st.session_state["search_engine"] = search_engine
-
-        # Séparateur
-        st.markdown("---")
+    # Boutons de génération : définis dans la colonne principale, sous chaque
+    # formulaire. Initialisés ici pour éviter tout NameError si le mode courant
+    # ne les crée pas.
+    generate_parliamentary_button = False
+    generate_analysis_button = False
 
 
 ##########################################################################
@@ -3479,8 +3559,8 @@ else:
         if mode == "Réponse parlementaire":
             st.markdown("#### Paramètres de réponse")
 
-            # Première ligne : Orientation (2/3) + Longueur (1/3)
-            col1, col2, col3 = st.columns([2, 1, 0.0001])
+            # Chemin principal : orientation + longueur, toujours visibles.
+            col1, col2 = st.columns([2, 1])
             with col1:
                 response_orientation_options = [
                     "Répondre de façon neutre",
@@ -3503,129 +3583,121 @@ else:
                     key="longueur"
                 )
 
-            # Deuxième ligne : Détail juridique (1/3) + Inclure recherche (1/3) + Articles optionnels (1/3)
-            colA, colB, colC = st.columns(3)
-            with colA:
-                detail_juridique = st.slider(
-                    "Niveau de détail juridique (1 = bas, 5 = élevé)",
-                    min_value=1,
-                    max_value=5,
-                    value=1,  # Valeur par défaut
-                    key="detail_juridique"
+            # Valeurs par défaut : les widgets ci-dessous vivent dans l'expander
+            # « Options avancées » (toujours rendu, même replié) et écrasent ces
+            # valeurs. Elles ne servent que de garde-fou si l'expander était retiré.
+            detail_juridique = st.session_state.get("detail_juridique", 3)
+            include_legal_articles = True
+            must_contain = ""
+            custom_instructions = ""
+
+            with st.expander("⚙️ Options avancées"):
+
+                # --- Modèle Mistral ---
+                _labels = list(_MODEL_LABELS)
+                _cur = st.session_state.get("model_size", MODELE_MISTRAL_DEFAUT)
+                _idx = next((i for i, lab in enumerate(_labels)
+                             if _MODEL_LABELS[lab] == _cur), 0)
+                model_label = st.selectbox(
+                    "Modèle Mistral", _labels, index=_idx, key="model_label"
+                )
+                st.session_state["model_size"] = _MODEL_LABELS[model_label]
+
+                st.markdown("---")
+
+                # --- Recherche dans les codes juridiques (activée par défaut) ---
+                include_legal_articles = st.toggle(
+                    "Rechercher dans les codes juridiques",
+                    value=True,
+                    key="include_legal_articles",
+                )
+                if include_legal_articles:
+                    cja, cjb = st.columns([1, 2])
+                    with cja:
+                        detail_juridique = st.slider(
+                            "Niveau de détail juridique (1 = bas, 5 = élevé)",
+                            min_value=1, max_value=5, value=3,
+                            key="detail_juridique",
+                            help="Pilote aussi le nombre d'articles de loi récupérés.",
+                        )
+                    with cjb:
+                        must_contain = st.text_input(
+                            "Les articles retenus doivent contenir (optionnel)",
+                            key="must_contain_input",
+                            placeholder="Ex: allocation, article 123, décret 2020-...",
+                        )
+
+                st.markdown("---")
+
+                # --- Instructions de rédaction ---
+                custom_instructions = st.text_area(
+                    "Instructions générales (max. 300 caractères)",
+                    placeholder="Ex: Insister sur l'aspect budgétaire, mentionner le projet de loi X...",
+                    height=100,
+                    max_chars=300,
+                    key="custom_instructions",
                 )
 
-            with colB:
-                include_legal_articles = st.selectbox(
-                    "Inclure une recherche dans les codes juridiques",
-                    ["Non", "Oui"],
-                    index=0,
-                    key="include_legal_articles"
-                ) == "Oui"
-
-            with colC:
-                must_contain = st.text_input(
-                    "Si oui, les articles sélectionnés doivent contenir exactement (optionnel)",
-                    key="must_contain_input",
-                    placeholder="Ex: allocation, article 123, décret 2020-..."
+                st.caption(
+                    "Instructions par sous-question — optionnel. Si le champ reste "
+                    "vide, la sous-question est traitée sans consigne spécifique."
                 )
-
-            # Debug temporaire pour vérifier les valeurs
-            st.markdown("---")
-            with st.expander("🔍 Vérifier les paramètres actuels"):
-                st.write("**Valeurs disponibles dans session_state:**")
-                debug_info = {
-                    "Orientation": st.session_state.get('response_orientation', 'Non défini'),
-                    "Longueur": st.session_state.get('longueur', 'Non défini'),
-                    "Détail juridique": st.session_state.get('detail_juridique', 'Non défini'),
-                    "Articles juridiques": st.session_state.get('include_legal_articles', 'Non défini'),
-                    "Contenu obligatoire": st.session_state.get('must_contain_input', 'Non défini')
-                }
-                st.json(debug_info)
-
-            st.markdown(
-                "<hr style='border:1px solid #bbb; width:100%;'>",
-                unsafe_allow_html=True
-            )
-
-            # Bloc Instructions pour la réponse
-            MAX_LEN = 300
-            st.markdown("#### Instructions pour la réponse (optionnel)")
-            st.markdown("##### Instructions générales (max. 300 caractères)")
-
-            custom_instructions = st.text_area(
-                "Instructions générales",
-                placeholder="Ex: Insister sur l'aspect budgétaire, mentionner le projet de loi X...",
-                height=100,
-                key="custom_instructions",
-                label_visibility="collapsed"
-            )
-
-            if custom_instructions:
-                remaining = MAX_LEN - len(custom_instructions)
-                if remaining < 0:
-                    st.warning(
-                        f"⚠️ Vous avez dépassé la limite de {MAX_LEN} caractères "
-                        f"({len(custom_instructions)} actuellement)."
+                if st.button("➕ Décomposer en sous-questions",
+                             help="Découpe la question en sous-questions pour leur donner des consignes distinctes"):
+                    st.session_state["subquestions"] = extract_subquestions(
+                        st.session_state.get("question_input", "")
                     )
-                    custom_instructions = custom_instructions[:MAX_LEN]
 
-            st.markdown("##### Instructions par sous-question (par défaut - ou si le champ est laissé vide - chaque sous-question est traitée sans instruction spécifique)")
-
-            # Bouton discret pour lancer la décomposition en sous-questions
-            if st.button("➕ Ajouter des instructions par sous-question", help="Décompose la question en sous-questions"):
-                subquestions = extract_subquestions(st.session_state.get("question_input", ""))
-                st.session_state["subquestions"] = subquestions
-
-            # Affichage des sous-questions avec champs d'instructions
-            if "subquestions" in st.session_state:
-                for i, sq in enumerate(st.session_state["subquestions"], start=1):
-                    with st.expander(f"Sous-question : {sq}"):
-                        if i == 1:
-                            # Exemple uniquement pour la sous-question 1
+                if "subquestions" in st.session_state:
+                    for i, sq in enumerate(st.session_state["subquestions"], start=1):
+                        with st.container(border=True):
+                            st.markdown(f"**Sous-question {i}.** {sq}")
                             st.text_area(
-                                f"Instructions pour la sous-question {i} (max. 200 caractères)",
+                                f"Instructions (max. 200 caractères)",
                                 key=f"instructions_sq_{i}",
                                 max_chars=200,
                                 height=80,
-                                placeholder="Ex : Renvoyer cette question au débat parlementaire sur le projet loi..., Rappeler qu'une concertation est en cours pour répondre à ce problème, Refuser la proposition au motif que..."
-                                # ou bien value="Exemple : Insister sur l'aspect budgétaire de la réponse"
-                            )
-                        else:
-                            st.text_area(
-                                f"Instructions pour la sous-question {i} (max. 200 caractères)",
-                                key=f"instructions_sq_{i}",
-                                max_chars=200,
-                                height=80
+                                label_visibility="collapsed",
+                                placeholder=(
+                                    "Ex : renvoyer au débat parlementaire en cours ; "
+                                    "rappeler qu'une concertation est engagée ; "
+                                    "refuser la proposition au motif que…"
+                                    if i == 1 else ""
+                                ),
                             )
 
+                st.markdown("---")
 
-            st.markdown("#### Limiter les documents sources (optionnel)")
-            use_priority_docs = st.checkbox(
-                "Rechercher uniquement dans les documents suivants :",
-                value=False,
-                key="use_priority_docs",
-                help="Attention : la réponse n'intègre ni plus les anciennes QE, ni les textes juridiques et ni la recherche internet"
+                # --- Limiter les sources ---
+                use_priority_docs = st.checkbox(
+                    "Limiter la recherche à certains documents",
+                    value=False,
+                    key="use_priority_docs",
+                    help="La réponse n'intègre alors ni les anciennes QE, ni les textes juridiques, ni la recherche internet.",
+                )
+                if use_priority_docs:
+                    collections = qdrant_client.get_collections()
+                    doc_collections = [
+                        col.name for col in collections.collections
+                        if col.name not in {"Code_de_la_sécurité_sociale", "Code_du_travail", "CASF", "QuestionParlementaire", "Code_de_la_santé_publique"}
+                        and "_" in col.name
+                        and not _is_legal_infra_collection(col.name)
+                    ]
+                    doc_names = [col.split('__')[0].replace('_', ' ') for col in doc_collections]
+                    selected_docs = st.multiselect(
+                        "Documents à utiliser",
+                        options=doc_names,
+                        key="priority_docs",
+                        placeholder="Choisir...",
+                    )
+
+            # Bouton de génération : sous le formulaire, dans le flux de lecture.
+            generate_parliamentary_button = st.button(
+                "Générer la réponse",
+                type="primary",
+                key="generate_parliamentary_button",
             )
 
-            if use_priority_docs:
-                # Récupère les collections "documents"
-                collections = qdrant_client.get_collections()
-                doc_collections = [
-                    col.name for col in collections.collections
-                    if col.name not in {"Code_de_la_sécurité_sociale", "Code_du_travail", "CASF", "QuestionParlementaire", "Code_de_la_santé_publique"}
-                    and "_" in col.name
-                    and not _is_legal_infra_collection(col.name)
-                ]
-
-                # Affiche les noms propres (sans timestamp)
-                doc_names = [col.split('__')[0].replace('_', ' ') for col in doc_collections]
-                selected_docs = st.multiselect(
-                    "Sélectionnez les documents",
-                    options=doc_names,
-                    key="priority_docs",
-                    placeholder="Choisir..."
-                )
-            
             st.markdown(
                 "<hr style='border:1px solid #bbb; width:100%;'>",
                 unsafe_allow_html=True
@@ -3653,8 +3725,16 @@ else:
                     key="max_articles_input"
                 )
 
-            # --- Affichage du bouton d'analyse juridique ---
-            search_button = st.button("Rechercher les articles", type="secondary", key="search_button")
+            # --- Boutons : rechercher les articles / générer l'analyse ---
+            bcol1, bcol2 = st.columns([1, 1])
+            with bcol1:
+                search_button = st.button(
+                    "Rechercher les articles", type="secondary", key="search_button"
+                )
+            with bcol2:
+                generate_analysis_button = st.button(
+                    "Générer l'analyse", type="primary", key="generate_analysis_button"
+                )
 
             st.markdown(
                 "<hr style='border:1px solid #bbb; width:100%;'>",
@@ -3676,10 +3756,10 @@ else:
                 # Récupération des valeurs depuis st.session_state
                 response_orientation = st.session_state.get('response_orientation', "Répondre de façon neutre")
                 longueur = st.session_state.get('longueur', "Courte (300 mots)")
-                detail_juridique = st.session_state.get('detail_juridique', 1)
-                include_legal_articles = st.session_state.get('include_legal_articles', False)
+                detail_juridique = st.session_state.get('detail_juridique', 3)
+                include_legal_articles = bool(st.session_state.get('include_legal_articles', True))
                 must_contain = st.session_state.get('must_contain_input', "")
-                model_size = st.session_state.get('model_size', 'small')
+                model_size = st.session_state.get('model_size', MODELE_MISTRAL_DEFAUT)
 
                 if mode == "Réponse parlementaire":
                     response_data = generate_response(
@@ -3695,15 +3775,18 @@ else:
                     )
 
                 elif mode == "Analyse juridique":
-                    response_data = generate_legal_analysis(
-                        question=question,
-                        must_contain=must_contain,
-                        max_articles=max_articles,
-                        threshold=threshold,
-                        model_size=model_size,
-                        search_button=search_button,
-                        generate_analysis_button=generate_analysis_button
-                    )
+                    # generate_legal_analysis capture stdout et n'émet aucun statut
+                    # dans l'UI : un spinner évite l'écran figé pendant l'appel.
+                    with st.spinner("Recherche des articles et analyse en cours…"):
+                        response_data = generate_legal_analysis(
+                            question=question,
+                            must_contain=must_contain,
+                            max_articles=max_articles,
+                            threshold=threshold,
+                            model_size=model_size,
+                            search_button=search_button,
+                            generate_analysis_button=generate_analysis_button
+                        )
 
                 # Détermination des onglets à afficher
                 tabs = []
