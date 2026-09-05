@@ -3476,6 +3476,7 @@ def generate_response(
     response_orientation: str = "Répondre de façon neutre",
     custom_instructions: str = "",
     consignes_sous_questions: Optional[Dict[str, str]] = None,
+    subquestions: Optional[List[str]] = None,
     include_legal_articles: bool = False,
     must_contain: str = "",
     max_legal_articles: int = 3,
@@ -3525,10 +3526,25 @@ def generate_response(
         # distiller la requête fiche (F9, étape 3) ; réutilisées telles quelles
         # pour le bloc DEMANDES à l'étape 5 (aucun appel Mistral supplémentaire —
         # avant, ce même appel était refait à l'étape 5).
-        try:
-            subquestions_prompt = extract_subquestions(question)
-        except Exception:
-            subquestions_prompt = []
+        # F20 : si l'interface a déjà décomposé la question, on REPREND sa
+        # liste au lieu d'en recalculer une seconde. Les deux étaient
+        # indépendantes : celle affichée venait de `question_input`, celle
+        # utilisée de la question validée. Le rédacteur annotait donc des
+        # sous-questions qui n'étaient pas nécessairement celles envoyées au
+        # modèle — et depuis F19 ses consignes y sont attachées.
+        #
+        # La reprise est sûre parce que l'interface EFFACE `subquestions` dès
+        # que le texte de la question change (invalidation en tête de script) :
+        # une liste qui survit a donc été calculée sur cette question-là.
+        # Bénéfice second : un appel `mistral-small` de moins par génération
+        # décomposée.
+        if subquestions:
+            subquestions_prompt = list(subquestions)
+        else:
+            try:
+                subquestions_prompt = extract_subquestions(question)
+            except Exception:
+                subquestions_prompt = []
 
         # Étape 1 : Recherche d'anciennes questions
         parliamentary_context = "Aucun contexte parlementaire trouvé."
@@ -4680,6 +4696,7 @@ else:
                         response_orientation=response_orientation,
                         custom_instructions=custom_instructions,
                         consignes_sous_questions=consignes_sous_questions,
+                        subquestions=st.session_state.get("subquestions"),
                         include_legal_articles=include_legal_articles,
                         must_contain=must_contain if include_legal_articles else "",
                         max_legal_articles=detail_juridique,
