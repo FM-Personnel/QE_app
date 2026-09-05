@@ -2667,6 +2667,7 @@ def generate_legal_analysis(
         if not sources:
             st.warning("Aucun article juridique valide après traitement.")
             return {
+                "question": question,   # F14 : de quoi rappeler la question traitée
                 "response": "Aucun article juridique valide après traitement.",
                 "sources": [],
                 "similar_documents": [],
@@ -2677,6 +2678,7 @@ def generate_legal_analysis(
         # --- Étape 6 : Mode "Recherche" ---
         if search_button:
             return {
+                "question": question,   # F14
                 "response": "Voir les articles dans l'onglet sources.",
                 "sources": sources,
                 "similar_documents": [],
@@ -2712,6 +2714,7 @@ def generate_legal_analysis(
             prep_placeholder.empty()
 
             return {
+                "question": question,   # F14
                 "response": legal_analysis,
                 "sources": sources,  # Liste originale pour l'affichage
                 "similar_documents": [],
@@ -2721,6 +2724,7 @@ def generate_legal_analysis(
 
     except Exception as e:
         return {
+            "question": question,   # F14
             "response": f"Erreur lors de la génération de l'analyse juridique : {str(e)}",
             "sources": [],
             "similar_documents": [],
@@ -2762,6 +2766,191 @@ def _cle_longueur(longueur: str) -> str:
         if (longueur or "").startswith(cle):
             return cle
     return "Moyenne"
+
+
+# --- F14 : rappeler à quelle question la réponse correspond -----------------
+# L'application n'affichait nulle part la question traitée. Un décalage entre
+# la question affichée dans le champ et celle réellement traitée était donc
+# INDÉTECTABLE : la boucle d'éval ne s'en apercevait qu'en recoupant
+# l'historique, un utilisateur n'a rien à recouper. Ça ne corrige pas la cause
+# du décalage (report de validation natif de `st.text_area`, hors de notre
+# portée) : ça rend visible ce qu'on ne peut pas prévenir à cette couche.
+_APERCU_QUESTION_MAX = 160
+
+
+def afficher_question_traitee(response_data: dict) -> None:
+    """Rappel discret de la question à laquelle la réponse affichée correspond.
+
+    Lit `response_data["question"]` — la question RÉELLEMENT passée à la
+    génération — et JAMAIS `st.session_state["question_input"]`, qui est la
+    valeur courante du champ de saisie. Les deux peuvent différer : c'est tout
+    l'objet de F14. Afficher la seconde ferait mentir le rappel exactement
+    comme l'onglet « Base documentaire » mentait avant F12.
+
+    Un aperçu suffit à reconnaître une question parlementaire (nom du
+    parlementaire et sujet arrivent en tête) ; le texte entier reste
+    consultable quand il est tronqué, pour lever un doute.
+    """
+    question = (response_data or {}).get("question") or ""
+    apercu = " ".join(question.split())
+    if not apercu:
+        return
+    tronque = len(apercu) > _APERCU_QUESTION_MAX
+    if tronque:
+        apercu = apercu[:_APERCU_QUESTION_MAX].rstrip() + "…"
+    st.caption(f"↳ Réponse à la question : « {apercu} »")
+    if tronque:
+        with st.expander("Voir la question traitée en entier"):
+            st.markdown(question)
+
+
+# --- Journal de génération : rendre l'instrument OBSERVABLE ------------------
+# Le journal existait déjà (`metadata["generation"]`) mais n'était rendu nulle
+# part : `feat/boucle` pilote un navigateur et ne voit que le DOM, `feat/eval`
+# a un harnais qui n'appelle pas ce chemin. Un instrument que personne ne peut
+# lire ne mesure rien — c'est la leçon de F12 poussée à son terme : là, l'onglet
+# montrait autre chose que le prompt ; ici il ne montrait rien.
+#
+# DEUX CONTRAINTES DE FORME, et elles se contredisent presque :
+#   · discret — ce n'est pas une information pour le lecteur d'une réponse
+#     parlementaire, c'est un instrument ;
+#   · lisible dans le DOM SANS interaction — un contenu qui n'apparaît qu'au
+#     survol, ou dans un dépliant dont Streamlit ne rendrait les enfants qu'une
+#     fois ouvert, serait aussi inobservable qu'un champ resté côté serveur.
+# D'où le choix : UNE ligne `st.caption` toujours rendue, préfixée `[generation]`
+# comme la trace console, en `clé=valeur` séparées par « · » — discrète à l'œil,
+# triviale à relever au grep. Le dépliant qui suit est un confort pour l'humain,
+# jamais le support de la mesure.
+_CHAMPS_JOURNAL = (
+    ("finish_reason", "fin"),
+    ("max_tokens", "plafond"),
+    ("mots", "mots"),
+    ("fin_propre", "fin_propre"),
+    ("prompt_tokens", "prompt_tokens"),
+    ("limite_prompt", "limite_prompt"),
+    ("marge_prompt", "marge_prompt"),
+)
+
+
+def afficher_journal_generation(response_data: dict) -> None:
+    """Trace de la génération, en pied de réponse, lisible sans interaction.
+
+    Source : `response_data["metadata"]["generation"]`, alimenté par
+    `_journaliser_finish_reason`. Absent sur le chemin « Analyse juridique »,
+    qui passe par `call_mistral_legal_analysis` et ne journalise pas : on
+    n'affiche alors rien plutôt qu'un cadre vide qui laisserait croire à une
+    mesure.
+    """
+    meta = (response_data or {}).get("metadata") or {}
+    gen = meta.get("generation") or {}
+    # Une réduction de contexte se signale MÊME sans journal : c'est elle qui
+    # change la réponse, et la taire serait le défaut qu'on corrige ailleurs.
+    reduction = meta.get("reduction_contexte")
+    morceaux = [f"{etiquette}={gen[cle]}" for cle, etiquette in _CHAMPS_JOURNAL
+                if gen.get(cle) is not None]
+    if not morceaux and not reduction:
+        return
+    if reduction:
+        retire = ", ".join(f"{k}:{v}" for k, v in (reduction.get("retire") or {}).items())
+        morceaux.append(f"contexte_reduit={reduction.get('avant')}->{reduction.get('apres')}")
+        morceaux.append(f"entrees_retirees=[{retire}]")
+    st.caption("[generation] " + " · ".join(morceaux))
+    if reduction:
+        # Visible à l'œil, pas seulement au grep : la réponse ci-dessus a été
+        # produite sur un contexte amputé, et le lecteur doit le savoir.
+        st.warning("Contexte trop volumineux pour la fenêtre du modèle : une partie a été "
+                   "écartée pour pouvoir répondre. La réponse est donc moins précise "
+                   f"qu'avec le contexte complet ({retire}).")
+    with st.expander("Journal de génération (détail)"):
+        st.json(gen if not reduction else {**gen, "reduction_contexte": reduction})
+
+
+# --- F16 : dégrader le contexte plutôt que refuser la génération -------------
+# Quand le prompt dépasse `fenêtre − max_tokens`, l'app rendait une ERREUR et
+# aucune réponse (#8167). Une réponse sur contexte réduit vaut mieux que pas de
+# réponse : on retire du contexte jusqu'à tenir, dans un ordre de sacrifice.
+#
+# CET ORDRE N'EST PAS UNE INTUITION : il est déduit de ce que le prompt dit
+# lui-même de chaque bloc.
+#   1. CONTEXTE PARLEMENTAIRE — le système le déclare utile « d'abord au
+#      registre, au ton et aux axes » et présume ses chiffres périmés. C'est le
+#      bloc dont on perd le moins en le coupant.
+#   2. RECHERCHE INTERNET — daté et sourcé, mais complémentaire.
+#   3. DOCUMENTS DE RÉFÉRENCE — déjà trié par score : couper la queue retire les
+#      extraits les plus faibles. Vient après les deux précédents parce que le
+#      système le désigne comme « la source à privilégier pour tout chiffre ».
+#   4. TEXTES JURIDIQUES — le prompt les dit « prioritaires en cas de
+#      contradiction ». Sacrifiés en dernier.
+# La QUESTION n'est jamais réduite ici : elle a déjà son plafond propre.
+#
+# DEUX GARANTIES, demandées par Coordination et vérifiées par le smoke :
+#   · le chemin normal n'est PAS touché — si le prompt tient, on sort avant
+#     d'avoir rien modifié, et la trace reste vide ;
+#   · `uploaded_documents` ne reçoit AUCUN budget permanent. Lui en donner un
+#     exigerait de choisir un nombre sans mesure — ce qui vient précisément de
+#     nous coûter une régression. Ici il n'est borné QUE pendant la dégradation,
+#     donc il ne peut pas mordre sur un cas qui fonctionne : c'est vrai par
+#     construction, pas par calibrage.
+_ORDRE_SACRIFICE = (
+    ("parliamentary_context", "contexte parlementaire"),
+    ("search_context", "recherche internet"),
+    ("uploaded_documents", "documents de référence"),
+    ("legal_context", "textes juridiques"),
+)
+
+
+def _reduire_bloc(texte: str, tokens_a_liberer: int) -> tuple:
+    """Retire des entrées ENTIÈRES par la fin, jamais un fragment.
+
+    Couper au milieu d'un extrait produirait exactement le défaut F7 — un
+    article amputé que le modèle « blanchit » en affirmation générale. On ne
+    retire donc que des entrées complètes, séparées par une ligne vide.
+
+    Le bloc réduit porte une mention explicite : sans elle, un contexte vidé se
+    lirait comme « rien trouvé » alors qu'il veut dire « écarté faute de place ».
+    La différence n'est pas cosmétique — F15 montre que le modèle fabrique un
+    processus quand il croit manquer de matière.
+    """
+    entrees = [e for e in (texte or "").split("\n\n") if e.strip()]
+    if not entrees:
+        return texte, 0
+    retirees = 0
+    while entrees and tokens_a_liberer > 0:
+        perdu = entrees.pop()
+        tokens_a_liberer -= estimate_tokens(perdu)
+        retirees += 1
+    if not retirees:
+        return texte, 0
+    mention = (f"(Bloc réduit : {retirees} entrée(s) écartée(s) faute de place dans la "
+               "fenêtre du modèle — absence de place, pas absence de source.)")
+    reste = "\n\n".join(entrees + [mention])
+    return reste, retirees
+
+
+def reduire_contextes_pour_tenir(blocs: dict, limite_prompt: int, construire, systeme: str):
+    """Réduit les contextes jusqu'à ce que le prompt tienne. Rend (blocs, trace).
+
+    `trace` vaut None quand rien n'a été touché — c'est le cas normal, et c'est
+    la garantie que ce mécanisme est inerte hors saturation.
+    """
+    blocs = dict(blocs)
+    total = estimate_tokens(systeme + construire(**blocs))
+    if total <= limite_prompt:
+        return blocs, None
+
+    trace = {"avant": total, "limite": limite_prompt, "retire": {}, "suffisant": False}
+    for cle, etiquette in _ORDRE_SACRIFICE:
+        if total <= limite_prompt:
+            break
+        nouveau, retirees = _reduire_bloc(blocs.get(cle, ""), total - limite_prompt)
+        if not retirees:
+            continue
+        blocs[cle] = nouveau
+        trace["retire"][etiquette] = retirees
+        total = estimate_tokens(systeme + construire(**blocs))
+    trace["apres"] = total
+    trace["suffisant"] = total <= limite_prompt
+    return blocs, trace
 
 
 # Message `system` de la réponse parlementaire : rôle, registre, garde-fous
@@ -2996,8 +3185,12 @@ def call_mistral_parliamentary_response(
     # prompt ET la réponse. L'ancien garde-fou comparait le prompt à la fenêtre
     # ENTIÈRE, donc un prompt de 15 000 tokens avec max_tokens=2200 passait le
     # contrôle puis se faisait refuser par l'API (17 200 > 16 000). Le défaut
-    # était latent — les prompts réels sont loin du plafond — mais relever les
-    # plafonds en rapproche, d'où la correction dans le même lot.
+    # était latent, et je l'ai cru lointain à tort : les prompts du HARNAIS sont
+    # loin du plafond (308 mesures, max 8112 tokens), ceux de l'APP ne le sont
+    # pas (#8167 : 14913). Relever les plafonds a fait basculer la bande
+    # 14201-15000 du refus opaque de l'API vers ce refus-ci. Cf. F16 : le vrai
+    # défaut est de refuser au lieu de dégrader, et `uploaded_documents` — le
+    # plus gros bloc — n'a aucun budget dans TOKEN_LIMITS.
     prompt_tokens = estimate_tokens(SYSTEME_REPONSE_PARLEMENTAIRE + prompt)
     fenetre = FENETRE_MODELE["large" if model_size == "large" else "autre"]
     max_allowed_prompt_tokens = fenetre - max_tokens
@@ -3030,7 +3223,9 @@ def call_mistral_parliamentary_response(
             # de vérifier qu'un relèvement de `max_tokens` fait bien baisser le
             # taux de coupure. Une hypothèse et sa mesure vont ensemble.
             _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens,
-                                       mistral_response)
+                                       mistral_response,
+                                       prompt_tokens=prompt_tokens,
+                                       limite_prompt=max_allowed_prompt_tokens)
 
             # F10 : ne tenter la complétion que si le texte ne se termine pas
             # déjà proprement — sinon on demanderait de « compléter » une
@@ -3064,7 +3259,8 @@ def call_mistral_parliamentary_response(
 _JOURNAL_FINISH_REASON_MAX = 200
 
 
-def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, texte) -> None:
+def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, texte,
+                               prompt_tokens=None, limite_prompt=None) -> None:
     entree = {
         "horodatage": datetime.now(pytz.timezone("Europe/Paris")).isoformat(),
         "finish_reason": finish_reason,
@@ -3077,6 +3273,15 @@ def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, 
         # utile pour distinguer « coupé au plafond » de « coupé ET visiblement
         # incomplet » : c'est le second cas qui produisait le défaut F10.
         "fin_propre": _se_termine_proprement(texte),
+        # F16 : la taille de prompt n'était mesurée NULLE PART en production.
+        # Son absence a laissé passer le couplage plafond/contexte — relever
+        # max_tokens retire autant de budget au prompt — jusqu'à ce qu'un cas
+        # saturé (#8167) ne rende plus aucune réponse. La marge est le chiffre
+        # qui dit à quelle distance du refus on travaille.
+        "prompt_tokens": prompt_tokens,
+        "limite_prompt": limite_prompt,
+        "marge_prompt": (None if prompt_tokens is None or limite_prompt is None
+                         else limite_prompt - prompt_tokens),
     }
     try:
         journal = st.session_state.setdefault("journal_finish_reason", [])
@@ -3086,7 +3291,8 @@ def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, 
         pass
     print(f"[generation] finish_reason={finish_reason} longueur={longueur!r} "
           f"modele={model_size} max_tokens={max_tokens} "
-          f"mots={entree['mots']} fin_propre={entree['fin_propre']}")
+          f"mots={entree['mots']} fin_propre={entree['fin_propre']} "
+          f"prompt_tokens={prompt_tokens} limite_prompt={limite_prompt}")
 
 
 # Complète une réponse tronquée (F10 : appelée seulement quand la réponse ne
@@ -3389,18 +3595,40 @@ def generate_response(
 
         # subquestions_prompt calculé à l'étape 1 (F9) — réutilisé tel quel ici.
 
-        prompt = build_parlementary_response_prompt(
-            question=truncate_text(question, max_tokens=TOKEN_LIMITS[current_model_size]['question']),
-            parliamentary_context=parliamentary_context,
-            legal_context=legal_context,
-            uploaded_documents=uploaded_docs_context,
-            detail_juridique=current_detail,
-            longueur=current_longueur,
-            response_orientation=current_orientation,
-            custom_instructions=custom_instructions,
-            search_context=search_context,
-            subquestions=subquestions_prompt,
+        # F16 : la limite dépend de la longueur demandée, puisque la fenêtre du
+        # modèle porte le prompt ET la réponse. On la calcule ici pour pouvoir
+        # dégrader AVANT l'appel, pendant que les blocs sont encore séparés —
+        # une fois le prompt assemblé, il faudrait le redécouper pour le réduire.
+        _limite_prompt = (FENETRE_MODELE["large" if current_model_size == "large" else "autre"]
+                          - _MAX_TOKENS_PAR_LONGUEUR[_cle_longueur(current_longueur)])
+
+        def _construire(**blocs):
+            return build_parlementary_response_prompt(
+                question=truncate_text(question,
+                                       max_tokens=TOKEN_LIMITS[current_model_size]['question']),
+                detail_juridique=current_detail,
+                longueur=current_longueur,
+                response_orientation=current_orientation,
+                custom_instructions=custom_instructions,
+                subquestions=subquestions_prompt,
+                **blocs,
+            )
+
+        _blocs, _reduction = reduire_contextes_pour_tenir(
+            {
+                "parliamentary_context": parliamentary_context,
+                "legal_context": legal_context,
+                "uploaded_documents": uploaded_docs_context,
+                "search_context": search_context,
+            },
+            _limite_prompt, _construire, SYSTEME_REPONSE_PARLEMENTAIRE,
         )
+        if _reduction:
+            # Une dégradation silencieuse serait le défaut qu'on passe la journée
+            # à corriger (F12, F14, F17) : elle change la réponse, elle doit se voir.
+            print(f"[contexte] réduit {_reduction['avant']} -> {_reduction['apres']} tokens "
+                  f"(limite {_limite_prompt}) : {_reduction['retire']}")
+        prompt = _construire(**_blocs)
 
         mistral_response = call_mistral_parliamentary_response(
             prompt,
@@ -3427,6 +3655,10 @@ def generate_response(
             # dernière trace de génération (finish_reason, mots, fin propre) —
             # remontée dans les métadonnées pour être lisible par la boucle d'éval
             "generation": (st.session_state.get("journal_finish_reason") or [{}])[-1],
+            # F16 : ce qui a été retiré du contexte pour tenir dans la fenêtre.
+            # None dans le cas normal — sa présence signale une réponse produite
+            # sur contexte réduit, donc moins précise qu'elle n'aurait pu l'être.
+            "reduction_contexte": _reduction,
         }
 
         return {
@@ -3518,6 +3750,62 @@ config = {
         }
     }
 }
+
+# --- Rôle administrateur (option A, validée par l'utilisateur le 06/09) ------
+# Alimenter la base documentaire reste ouvert à TOUS les comptes connectés.
+# Seuls SUPPRIMER et RENOMMER une collection sont réservés.
+#
+# La liste vit dans un secret Streamlit, pas dans le code : ajouter ou retirer
+# un administrateur se fait en éditant le secret, SANS redéploiement. Et le
+# rôle reste porté par un compte nominatif, donc chaque action est
+# attribuable à une personne — c'est ce qui avait fait écarter l'idée d'un
+# mot de passe administrateur partagé.
+#
+# Secret à créer côté Streamlit Cloud (Settings -> Secrets) :
+#     ADMIN_USERNAMES = "Whisler,Delphine"
+# (noms d'utilisateur tels qu'ils figurent dans `config`, séparés par des virgules)
+ADMIN_USERNAMES_ENV = "ADMIN_USERNAMES"
+
+
+def _comptes_admin() -> set:
+    """Comptes administrateurs déclarés dans le secret. Lu à CHAQUE appel, pour
+    qu'une modification du secret prenne effet sans redéploiement."""
+    brut = os.getenv(ADMIN_USERNAMES_ENV, "") or ""
+    return {u.strip() for u in brut.split(",") if u.strip()}
+
+
+def est_admin() -> bool:
+    """Le compte connecté est-il administrateur ?
+
+    FERMÉ PAR DÉFAUT : si le secret est absent ou vide, PERSONNE ne l'est.
+    L'inverse (tout le monde administrateur faute de configuration) serait le
+    pire comportement possible pour un contrôle d'accès.
+    """
+    if st.session_state.get("authentication_status") is not True:
+        return False
+    utilisateur = (st.session_state.get("username") or "").strip()
+    return bool(utilisateur) and utilisateur in _comptes_admin()
+
+
+def exiger_admin(action: str) -> bool:
+    """Garde-fou côté ACTION. À appeler DANS le corps du bouton, pas seulement
+    autour de son affichage.
+
+    Masquer un bouton sans protéger le chemin qu'il déclenche, ce serait
+    reproduire F12 : deux règles pour une même décision, qui finissent par
+    diverger. Ici l'affichage et l'action appellent tous deux `est_admin()`.
+
+    Journalise QUI agit, et QUI a tenté sans le droit — le rôle est nominatif,
+    autant que la trace le soit.
+    """
+    utilisateur = st.session_state.get("username") or "(inconnu)"
+    if est_admin():
+        print(f"[admin] {utilisateur!r} : {action}")
+        return True
+    st.error("Action réservée aux administrateurs de la base documentaire.")
+    print(f"[admin] REFUS — {utilisateur!r} a tenté : {action}")
+    return False
+
 
 if 'authentication_status' not in st.session_state:
     st.session_state.authentication_status = None
@@ -3719,6 +4007,13 @@ else:
                     key=lambda name: name.split('__')[0].replace('_', ' ').lower()
                 )
 
+                # Calculé une fois pour toute la liste. Alimenter la base reste
+                # ouvert à tous ; seuls renommer et supprimer sont réservés.
+                _peut_administrer = est_admin()
+                if not _peut_administrer:
+                    st.caption("ℹ️ Renommer et supprimer un document sont réservés aux "
+                               "administrateurs. L'ajout de documents reste ouvert à tous.")
+
                 for doc_name in sorted_collections:
                     clean_name = doc_name.split('__')[0].replace('_', ' ')
                     col1, col2, col3 = st.columns([18, 1, 1])  # plus de place pour le nom
@@ -3726,17 +4021,25 @@ else:
                     with col1:
                         st.markdown(f"📄 {clean_name}")
 
+                    # Renommer / supprimer : réservé aux administrateurs. Les
+                    # boutons sont ABSENTS pour les autres comptes, pas grisés ni
+                    # présents-puis-refusés : un bouton qui échoue se lit comme
+                    # une panne. L'action est garde-fouée en plus de l'affichage.
                     with col2:
-                        if st.button("✏️", key=f"rename_{doc_name}", help="Renommer le document"):
-                            st.session_state.show_rename_modal = True
-                            st.session_state.current_doc_to_rename = doc_name
-                            st.rerun()
+                        if _peut_administrer and st.button("✏️", key=f"rename_{doc_name}",
+                                                           help="Renommer le document"):
+                            if exiger_admin(f"ouverture du renommage de {doc_name!r}"):
+                                st.session_state.show_rename_modal = True
+                                st.session_state.current_doc_to_rename = doc_name
+                                st.rerun()
 
                     with col3:
-                        if st.button("🗑️", key=f"del_{doc_name}", help="Supprimer le document"):
-                            qdrant_client.delete_collection(collection_name=doc_name)
-                            st.success(f"Document '{clean_name}' supprimé.")
-                            st.rerun()
+                        if _peut_administrer and st.button("🗑️", key=f"del_{doc_name}",
+                                                           help="Supprimer le document"):
+                            if exiger_admin(f"suppression de la collection {doc_name!r}"):
+                                qdrant_client.delete_collection(collection_name=doc_name)
+                                st.success(f"Document '{clean_name}' supprimé.")
+                                st.rerun()
 
                 # Fenêtre modale de renommage
                 if st.session_state.show_rename_modal:
@@ -3757,6 +4060,12 @@ else:
 
                         with col1:
                             if st.button("Valider", key=f"validate_rename_{doc_name}"):
+                                # Le renommage SUPPRIME l'ancienne collection en fin
+                                # de parcours : garde-fou ici aussi, l'état de la
+                                # fenêtre modale pouvant survivre à un changement de
+                                # compte dans la même session.
+                                if not exiger_admin(f"renommage de la collection {doc_name!r}"):
+                                    st.stop()
                                 if new_name.strip():
                                     try:
                                         # 1. Vérification si le nouveau nom existe déjà
@@ -4316,7 +4625,9 @@ else:
                             if mode == "Réponse parlementaire":
                                 if "📜 Réponse" in tabs[i]:
                                     st.markdown("#### Réponse générée")
+                                    afficher_question_traitee(response_data)   # F14
                                     st.markdown(response_data["response"])
+                                    afficher_journal_generation(response_data)  # instrument
                                     if response_data.get("debug_logs"):
                                         with st.expander("🐛 Voir les logs de recherche"):
                                             st.text_area("Logs", response_data["debug_logs"], height=200)
@@ -4502,20 +4813,28 @@ else:
                                                 # Actions sur la collection
                                                 col1, col2 = st.columns([1, 1])
                                                 target_collection = results[0]["collection"]
+                                                # Mêmes deux actions que dans l'onglet de
+                                                # gestion, sur les mêmes objets : même
+                                                # protection. Les laisser ouvertes ici
+                                                # aurait vidé la mesure de son sens.
+                                                _admin_ici = est_admin()
                                                 with col1:
-                                                    if st.button("✏️ Renommer", key=f"rename_{target_collection}"):
-                                                        st.session_state.show_rename_modal = True
-                                                        st.session_state.current_doc_to_rename = target_collection
-                                                        st.rerun()
+                                                    if _admin_ici and st.button("✏️ Renommer", key=f"rename_{target_collection}"):
+                                                        if exiger_admin(f"ouverture du renommage de {target_collection!r}"):
+                                                            st.session_state.show_rename_modal = True
+                                                            st.session_state.current_doc_to_rename = target_collection
+                                                            st.rerun()
                                                 with col2:
-                                                    if st.button("🗑️ Supprimer", key=f"del_{target_collection}"):
-                                                        qdrant_client.delete_collection(collection_name=target_collection)
-                                                        st.success(f"Document '{doc_name}' supprimé.")
-                                                        st.rerun()
+                                                    if _admin_ici and st.button("🗑️ Supprimer", key=f"del_{target_collection}"):
+                                                        if exiger_admin(f"suppression de la collection {target_collection!r}"):
+                                                            qdrant_client.delete_collection(collection_name=target_collection)
+                                                            st.success(f"Document '{doc_name}' supprimé.")
+                                                            st.rerun()
 
                             elif mode == "Analyse juridique":
                                 if "📜 Analyse" in tabs[i]:
                                     st.markdown("#### Analyse juridique générée")
+                                    afficher_question_traitee(response_data)   # F14
                                     st.markdown(response_data["response"])
 
                                     # Affichage des logs (si disponibles)
