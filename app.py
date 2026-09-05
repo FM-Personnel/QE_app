@@ -2731,6 +2731,39 @@ def generate_legal_analysis(
         if 'old_stdout' in locals():
             sys.stdout = old_stdout
 
+# --- Plafonds de génération (max_tokens) ---------------------------------
+# Validés par l'utilisateur le 06/09 sur le chiffrage de `app_findings.md` § F10.
+#
+# PRINCIPE : le plafond est un GARDE-FOU CONTRE L'EMBALLEMENT, pas un second
+# régulateur de longueur. La longueur est pilotée par la consigne du prompt
+# (`_LONGUEUR_MOTS`). Tant que le plafond était au ras de la cible, c'est LUI
+# qui terminait la réponse au lieu de la composition du modèle — d'où des
+# coupures en plein mot : les 3 occurrences de F10 sont toutes en « Moyenne »,
+# précisément la longueur où la marge était nulle.
+#
+# CALIBRAGE : ~1,6 à 1,8 fois le besoin au HAUT de la fourchette, avec un besoin
+# estimé à 1,63-1,71 token par mot (6,82 caractères/mot mesurés sur 55 réponses
+# réelles ; 4,0 à 4,19 caractères/token).
+#
+#   longueur   cible (mots)   besoin au plafond de cible   avant   après
+#   Courte     250-350        570-597                      500     1000
+#   Moyenne    450-600        977-1023                     1000    1800
+#   Longue     900-1200       1953-2046                    2200    3200
+_MAX_TOKENS_PAR_LONGUEUR = {"Courte": 1000, "Moyenne": 1800, "Longue": 3200}
+
+# Fenêtre de contexte du modèle (prompt + réponse). Sert à réserver la place de
+# la réponse dans le garde-fou de taille de prompt.
+FENETRE_MODELE = {"large": 32000, "autre": 16000}
+
+
+def _cle_longueur(longueur: str) -> str:
+    """« Moyenne (500 mots) » -> « Moyenne ». Repli sur Moyenne si inconnu."""
+    for cle in _MAX_TOKENS_PAR_LONGUEUR:
+        if (longueur or "").startswith(cle):
+            return cle
+    return "Moyenne"
+
+
 # Message `system` de la réponse parlementaire : rôle, registre, garde-fous
 # d'exactitude et glossaire — partie stable, réutilisée à chaque appel.
 SYSTEME_REPONSE_PARLEMENTAIRE = """Vous êtes rédacteur au sein d'un cabinet ministériel. Vous rédigez le projet de réponse à une question écrite (QE) d'un parlementaire, portant sur la sphère sociale et médico-sociale française. Le texte sera publié au Journal officiel.
@@ -2956,14 +2989,23 @@ def call_mistral_parliamentary_response(
     }
 
     model_name = f"mistral-{model_size}-latest"
-    max_tokens = 500 if longueur.startswith("Courte") else 1000 if longueur.startswith("Moyenne") else 2200
+    max_tokens = _MAX_TOKENS_PAR_LONGUEUR[_cle_longueur(longueur)]
 
-    # Vérifier la taille du prompt (système + utilisateur)
+    # Vérifier la taille du prompt (système + utilisateur).
+    # La place de la RÉPONSE doit être réservée : la fenêtre du modèle porte le
+    # prompt ET la réponse. L'ancien garde-fou comparait le prompt à la fenêtre
+    # ENTIÈRE, donc un prompt de 15 000 tokens avec max_tokens=2200 passait le
+    # contrôle puis se faisait refuser par l'API (17 200 > 16 000). Le défaut
+    # était latent — les prompts réels sont loin du plafond — mais relever les
+    # plafonds en rapproche, d'où la correction dans le même lot.
     prompt_tokens = estimate_tokens(SYSTEME_REPONSE_PARLEMENTAIRE + prompt)
-    max_allowed_prompt_tokens = 32000 if model_size == "large" else 16000
+    fenetre = FENETRE_MODELE["large" if model_size == "large" else "autre"]
+    max_allowed_prompt_tokens = fenetre - max_tokens
 
     if prompt_tokens > max_allowed_prompt_tokens:
-        raise ValueError(f"Prompt trop long: {prompt_tokens} tokens (limite: {max_allowed_prompt_tokens})")
+        raise ValueError(
+            f"Prompt trop long: {prompt_tokens} tokens (limite: {max_allowed_prompt_tokens} "
+            f"= fenêtre {fenetre} − {max_tokens} réservés à la réponse, longueur {longueur!r})")
 
     payload = {
         "model": model_name,
@@ -2982,7 +3024,13 @@ def call_mistral_parliamentary_response(
             data = response.json()
 
             mistral_response = data["choices"][0]["message"]["content"]
-            is_truncated = data["choices"][0].get("finish_reason") == "length"
+            finish_reason = data["choices"][0].get("finish_reason")
+            is_truncated = finish_reason == "length"
+            # Mesure (F10 / chiffrage max_tokens) : sans cette trace, impossible
+            # de vérifier qu'un relèvement de `max_tokens` fait bien baisser le
+            # taux de coupure. Une hypothèse et sa mesure vont ensemble.
+            _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens,
+                                       mistral_response)
 
             # F10 : ne tenter la complétion que si le texte ne se termine pas
             # déjà proprement — sinon on demanderait de « compléter » une
@@ -3008,6 +3056,38 @@ def call_mistral_parliamentary_response(
                 time.sleep(10)
             else:
                 raise Exception(f"Erreur réseau: {str(e)}")
+
+# Trace du `finish_reason` de chaque génération, exposée à l'appelant via
+# `st.session_state` : c'est la mesure qui permettra de vérifier l'effet d'un
+# changement de `max_tokens` (taux de `length` par longueur). Volontairement
+# passive — elle n'altère jamais la réponse.
+_JOURNAL_FINISH_REASON_MAX = 200
+
+
+def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, texte) -> None:
+    entree = {
+        "horodatage": datetime.now(pytz.timezone("Europe/Paris")).isoformat(),
+        "finish_reason": finish_reason,
+        "tronque": finish_reason == "length",
+        "longueur": longueur,
+        "modele": model_size,
+        "max_tokens": max_tokens,
+        "caracteres": len(texte or ""),
+        "mots": len((texte or "").split()),
+        # utile pour distinguer « coupé au plafond » de « coupé ET visiblement
+        # incomplet » : c'est le second cas qui produisait le défaut F10.
+        "fin_propre": _se_termine_proprement(texte),
+    }
+    try:
+        journal = st.session_state.setdefault("journal_finish_reason", [])
+        journal.append(entree)
+        del journal[:-_JOURNAL_FINISH_REASON_MAX]
+    except Exception:  # noqa: BLE001 — hors runtime Streamlit : la trace ne doit rien casser
+        pass
+    print(f"[generation] finish_reason={finish_reason} longueur={longueur!r} "
+          f"modele={model_size} max_tokens={max_tokens} "
+          f"mots={entree['mots']} fin_propre={entree['fin_propre']}")
+
 
 # Complète une réponse tronquée (F10 : appelée seulement quand la réponse ne
 # se termine PAS proprement, cf. _se_termine_proprement — voir le point d'appel)
@@ -3154,34 +3234,22 @@ def generate_response(
         # Limites de tokens pour Mistral Large
         TOKEN_LIMITS = {
             "large": {
-                "system_prompt": 2000,
                 "question": 1500,
                 "parliamentary_context": 4500,  # 3 réponses QE max
                 "search_context": 3000,         # 15 snippets Google
-                "uploaded_documents": 5000,     # 10 chunks max
                 "legal_context": 5000,          # À affiner plus tard
-                "response": 6000,
-                "safety_margin": 3000,
             },
             "medium": {
-                "system_prompt": 1500,
                 "question": 1000,
                 "parliamentary_context": 3000,  # 2 réponses QE max
                 "search_context": 1500,         # 10 snippets Google
-                "uploaded_documents": 2500,     # 5 chunks max
                 "legal_context": 2000,          # À affiner plus tard
-                "response": 4000,               # Réponse plus longue que small
-                "safety_margin": 1500,
             },
             "small": {
-                "system_prompt": 1500,          # Même valeur que medium
                 "question": 1000,               # Même valeur que medium
                 "parliamentary_context": 3000,  # 2 réponses QE max (même que medium)
                 "search_context": 1500,         # 10 snippets Google (même que medium)
-                "uploaded_documents": 2500,     # 5 chunks max (même que medium)
                 "legal_context": 2000,          # Même que medium
-                "response": 2000,               # Réponse plus courte que medium
-                "safety_margin": 1500,          # Même que medium
             }
         }
 
@@ -3356,6 +3424,9 @@ def generate_response(
             "rubrique": rubrique,
             "custom_instructions": custom_instructions,
             "placeholders_restants": compter_placeholders(mistral_response),
+            # dernière trace de génération (finish_reason, mots, fin propre) —
+            # remontée dans les métadonnées pour être lisible par la boucle d'éval
+            "generation": (st.session_state.get("journal_finish_reason") or [{}])[-1],
         }
 
         return {
