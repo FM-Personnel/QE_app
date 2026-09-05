@@ -1780,6 +1780,156 @@ def render_articles_flat(container, articles: list):
             container.markdown(f"**Texte complet :**\n\n{art.get('contenu','')}")
 
 # Fonction de recherches de documents dans tout le RAG (hors codes et jeu de données QE) pour alimenter l'API
+# --- F9 : requête distillée pour la recherche fiche ---
+# Constat (05/09, cf. app_findings.md § F9) : le retrieval fiche est piloté par le
+# recouvrement lexical dense ; une question réelle (1300-2700 caractères), chargée
+# de références statutaires et de détails de l'espèce (dates, lieux, n° de décret),
+# dilue le signal thématique dans le vecteur. Une sonde courte, topiquement dense,
+# le concentre. `_qe_subject`/`_qe_expand_acronyms` (F2, déjà en prod) isolent déjà
+# le sujet et développent les sigles pour rien ; on y ajoute les sous-questions
+# reformulées (déjà calculées pour le bloc DEMANDES, aucun appel Mistral de plus).
+# Débrayable à 4 valeurs. **MESURÉ le 06/09** (`feat/eval`, 4 runs
+# `--fiche-vector` sur 6 cas, score brut de fiche) — les noms du harnais
+# d'éval diffèrent des valeurs ci-dessous, correspondance vérifiée sur les
+# 18 cas de `distilled-queries.json` (recalcul identique 18/18) :
+#
+#   valeur ici              harnais      clé d'embedding      score brut moyen
+#   "off"                   raw          <id> (question)      0,708
+#   "sujet"                 subject      <id>::fiche_sujet    0,749
+#   "sujet_sousquestions"   distilled    <id>::fiche          0,759  ← DÉFAUT
+#   "resume"                resume       <id>::fiche_resume   0,718
+#
+#   "off"                 : question brute (comportement d'avant F9).
+#   "sujet"                : sujet isolé + sigles développés SEULS — court, dense,
+#                            zéro appel Mistral de plus que la prod n'en fait déjà.
+#   "sujet_sousquestions" : sujet + sous-questions reformulées (hypothèse F9
+#                            initiale, 6712d41) — **DÉFAUT depuis le 06/09** :
+#                            +0,052 sur la question brute, gagne sur les 5 cas
+#                            où une fiche remonte, aucune régression. Aucun appel
+#                            Mistral supplémentaire (les sous-questions sont déjà
+#                            calculées pour le bloc DEMANDES).
+#   "resume"               : résumé topique par UN appel Mistral dédié (voir
+#                            resumer_requete_fiche) — mesuré 0,718, soit **à la
+#                            fois le plus cher (+1 appel/génération) et moins bon
+#                            que la distillation pure Python**. Conservé et testé,
+#                            mais sans intérêt démontré ; la piste « v4 plus
+#                            courte » est abandonnée.
+#
+# Réserves du verdict (détail dans app_findings.md § F9) : le gain est propre à
+# l'écart texte-réel/fiche, quasi nul (+0,002) sur les sondes du reference-set
+# déjà pré-alignées ; `qe-7021` reste non résolu et ne peut pas l'être par la
+# distillation (écart de CONTENU de la fiche, pas de vocabulaire).
+DISTILLER_REQUETE_FICHE = "sujet_sousquestions"  # "off" | "sujet" | "sujet_sousquestions" | "resume"
+
+
+def distiller_requete_fiche(question: str, subquestions: Optional[List[str]] = None) -> str:
+    """Requête dédiée à la recherche dans les collections `fiche_de_reference*`.
+
+    Ne s'applique qu'à la recherche fiche (search_uploaded_documents) ; la
+    recherche dans les autres collections-documents et tout le reste du
+    retrieval (QE, articles) restent sur la question brute.
+    """
+    sujet = _qe_expand_acronyms(_qe_subject(question))
+    if subquestions:
+        return f"{sujet} {' '.join(subquestions)}".strip()
+    return sujet
+
+
+# Prompt exact (mandat Coordination, nuit du 05/09) — cité tel quel dans
+# app_findings.md § F9 pour reproductibilité. Ne pas paraphraser sans mettre
+# les deux à jour ensemble.
+_RESUME_FICHE_SYSTEME = (
+    "Vous résumez une question parlementaire en 2 à 4 phrases, dans le vocabulaire "
+    "administratif standard d'une fiche de référence documentaire (pas le registre "
+    "d'une question écrite). Consignes strictes : n'incluez aucune amorce "
+    "parlementaire (ne mentionnez ni le nom du parlementaire, ni « appelle "
+    "l'attention », ni le ministre) ; nommez le dispositif ou la mesure concernée ; "
+    "nommez le ou les publics concernés ; citez les textes de loi, décrets ou "
+    "arrêtés mentionnés avec leur numéro et leur date s'ils figurent dans la "
+    "question ; employez les termes techniques du domaine (sigles développés une "
+    "fois si utile). Rédigez en PROSE CONTINUE UNIQUEMENT : aucun markdown, aucun "
+    "astérisque, aucun tiret, aucun titre, aucune liste à puces — des phrases "
+    "complètes reliées entre elles, comme dans le corps d'une fiche de référence. "
+    "Longueur impérative : 250 à 400 caractères MAXIMUM, pas plus. N'inventez aucun "
+    "fait, aucune date, aucun numéro qui ne figure pas dans le texte fourni."
+)
+
+
+def resumer_requete_fiche(question: str, model: str = "mistral-small-latest") -> str:
+    """F9 (mode "resume") — résumé topique de la question par un appel Mistral
+    dédié, `temperature=0` (reproductibilité). Un appel supplémentaire PAR
+    GÉNÉRATION quand ce mode est actif (latence/coût estimés dans
+    PASSATION-app.md) ; aucun appel si le mode n'est pas "resume" (défaut
+    inchangé). Les erreurs réseau/API remontent à l'appelant, qui retombe sur
+    `fiche_query=None` (comportement identique aux autres modes, cf.
+    generate_response).
+
+    Même défaut que F10 possible ici : avec plusieurs références légales à
+    citer, le modèle dépasse parfois le plafond de tokens et coupe en plein
+    mot (« ...loi n° 86-33 du »). Filet de sécurité identique à F10 : si
+    `finish_reason == "length"` et que le texte ne se termine pas proprement,
+    on le ramène à sa dernière phrase complète plutôt que de renvoyer un
+    fragment cassé (une référence tronquée serait pire qu'une référence en
+    moins pour une requête d'embedding).
+    """
+    r = requests.post(
+        "https://api.mistral.ai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _RESUME_FICHE_SYSTEME},
+                {"role": "user", "content": question},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 160,  # cohérent avec les 400 c max demandés, marge incluse
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    resume = data["choices"][0]["message"]["content"].strip()
+    if data["choices"][0].get("finish_reason") == "length" and not _se_termine_proprement(resume):
+        dernier_point = resume.rfind(".")
+        resume = resume[:dernier_point + 1].strip() if dernier_point > 0 else ""
+    return resume
+
+
+# --- F12 : règle de rétention des extraits documentaires, UNE SEULE définition ---
+# Le mécanisme « fiche de référence » (contenu curé, chiffres datés) a trois
+# paramètres, historiquement recopiés à la main à chaque point d'usage :
+# un boost de score, un seuil standard, un seuil assoupli réservé aux fiches.
+# Cette duplication a produit le bug F12 : l'onglet « Base documentaire »
+# filtrait à 0,70 SANS la clause fiche, alors que l'injection dans le prompt
+# l'appliquait — un extrait de fiche entre 0,45 et 0,70 partait au modèle
+# sans jamais s'afficher, rendant l'onglet trompeur comme instrument
+# d'observation. Tout passe désormais par ces constantes et `extrait_retenu`.
+BOOST_FICHE = 0.12          # bonus de score appliqué aux extraits de fiches de référence
+SEUIL_DOC_STANDARD = 0.70   # score minimal d'un extrait de document pour être retenu
+SEUIL_FICHE_ASSOUPLI = 0.45 # seuil abaissé, réservé aux fiches de référence
+
+
+def extrait_retenu(doc: Dict, min_score: float = SEUIL_DOC_STANDARD) -> bool:
+    """Un extrait documentaire est-il retenu ? (F12 — règle unique)
+
+    Retenu s'il atteint le seuil standard, OU s'il s'agit d'une fiche de
+    référence atteignant le seuil assoupli. Utilisée par l'injection dans le
+    prompt (`format_uploaded_docs_by_relevance`) ET par l'affichage de
+    l'onglet « Base documentaire » : les deux doivent montrer le même
+    ensemble, sinon l'onglet ment sur ce que le modèle a réellement reçu.
+    """
+    score = doc.get("score") or 0
+    return score >= min_score or (bool(doc.get("is_fiche")) and score >= SEUIL_FICHE_ASSOUPLI)
+
+
+def extrait_marginal(doc: Dict, min_score: float = SEUIL_DOC_STANDARD) -> bool:
+    """Vrai si l'extrait n'est retenu QUE par la clause fiche assouplie —
+    c'est-à-dire sous le seuil standard. Sert à le signaler à l'affichage,
+    pour qu'un extrait faible ne se lise pas comme un extrait fort."""
+    score = doc.get("score") or 0
+    return bool(doc.get("is_fiche")) and SEUIL_FICHE_ASSOUPLI <= score < min_score
+
+
 def search_uploaded_documents(
     query: str,
     qdrant_client: Any,
@@ -1787,6 +1937,7 @@ def search_uploaded_documents(
     selected_collections: List[str] = None,
     top_k: int = 5,
     top_k_selected = 10,
+    fiche_query: Optional[str] = None,
 ) -> List[Dict]:
     """
     Recherche dans les collections-documents (1 collection = 1 document).
@@ -1797,10 +1948,17 @@ def search_uploaded_documents(
         selected_collections: Liste des collections à rechercher (optionnel).
         top_k: Nombre de résultats max si aucune collection sélectionnée.
         top_k_selected: Nombre de résultats max si collections sélectionnées.
+        fiche_query: si fourni et différent de `query`, requête utilisée pour
+            EMBEDDER la recherche dans les collections fiche uniquement (F9).
     Returns:
         Liste de dicts avec les champs essentiels.
     """
     query_embedding = embedding_model.encode(query).tolist()
+    # F9 : vecteur dédié aux fiches, un seul appel supplémentaire au modèle déjà
+    # chargé (aucun nouveau modèle, aucun appel réseau) — seulement si la requête
+    # distillée diffère de la question brute.
+    fiche_embedding = (embedding_model.encode(fiche_query).tolist()
+                       if fiche_query and fiche_query != query else query_embedding)
     all_results = []
     try:
         # 1. Récupère les collections à rechercher
@@ -1830,7 +1988,7 @@ def search_uploaded_documents(
                 _is_fiche_coll = collection.lower().startswith("fiche_de_reference")
                 results = qdrant_client.query_points(
                     collection_name=collection,
-                    query=query_embedding,
+                    query=fiche_embedding if _is_fiche_coll else query_embedding,  # F9
                     limit=30 if _is_fiche_coll else top_k,  # fiche : on veut voir tous ses chunks
                     with_payload=True,
                     with_vectors=False,
@@ -1846,7 +2004,7 @@ def search_uploaded_documents(
                     payload = result.payload or {}
                     score = float(result.score) if hasattr(result, "score") else None
                     if score is not None and is_fiche:
-                        score = min(1.0, score + 0.12)
+                        score = min(1.0, score + BOOST_FICHE)
                     all_results.append({
                         "collection": collection,
                         "text": payload.get("text", ""),
@@ -1864,7 +2022,7 @@ def search_uploaded_documents(
         all_results.sort(key=lambda x: (x["score"] is not None, x["score"]), reverse=True)
         top = all_results[:top_k]
         fiches = [r for r in all_results
-                  if r.get("is_fiche") and (r.get("score") or 0) >= 0.45][:8]
+                  if r.get("is_fiche") and (r.get("score") or 0) >= SEUIL_FICHE_ASSOUPLI][:8]
         for r in fiches:
             if r not in top:
                 top.append(r)
@@ -1877,7 +2035,7 @@ def search_uploaded_documents(
 # Fonction qui ajuste la taille du contexte issu des "autres collections" à la pertinence (score) du retrieval
 def format_uploaded_docs_by_relevance(
     uploaded_results: List[Dict],
-    min_score: float = 0.7,
+    min_score: float = SEUIL_DOC_STANDARD,
     max_docs: int = 5,
     max_length: int = 400
 ) -> str:
@@ -1891,13 +2049,11 @@ def format_uploaded_docs_by_relevance(
     if not uploaded_results:
         return ""
 
-    # Filtrer par score. Seuil assoupli pour les fiches de référence (contenu curé
-    # et daté, à faire remonter même quand le score brut du modèle reste modeste).
-    filtered = [
-        doc for doc in uploaded_results
-        if doc.get("score", 0) >= min_score
-        or (doc.get("is_fiche") and doc.get("score", 0) >= 0.45)
-    ]
+    # Filtrer par score — règle unique `extrait_retenu` (F12), partagée avec
+    # l'affichage de l'onglet « Base documentaire » pour que les deux montrent
+    # le même ensemble. Seuil assoupli pour les fiches de référence (contenu
+    # curé et daté, à faire remonter même quand le score brut reste modeste).
+    filtered = [doc for doc in uploaded_results if extrait_retenu(doc, min_score)]
 
     # Trier par score décroissant
     filtered.sort(key=lambda d: d.get("score", 0), reverse=True)
@@ -2076,20 +2232,42 @@ def _cle_extrait(item: dict) -> str:
     return re.sub(r"[^a-z0-9àâäéèêëïîôöùûüç]+", " ", extrait).strip()[:160]
 
 
+# F3 — plafond des résultats internet, RÉFUTÉ par la mesure (06/09, voir app_findings.md).
+# Contexte (nuit du 05/09) : survivants observés #6491→9, #8922→10, #3171→7,
+# #5621→8 ; sur #8922, ~2-3 des 10 retenus étaient pertinents, le reste du bruit
+# historique. Piste 1 (plafond absolu) appliquée avec un tri par recouvrement
+# lexical pour ne pas découper arbitrairement (Google ne renvoie pas de score
+# réel). MESURÉE le 06/09 sur #5621 dans l'app en ligne : le seul résultat
+# pertinent-et-exploité des rangs 6-10 est au RANG 8 (fauteuils roulants), cité
+# dans les réponses générées — le tri par termes saillants ne le sauve pas non
+# plus (il n'est classé qu'en position 8 après tri). Un plafond à 5 l'aurait
+# coupé. RÉFUTÉE : le code reste, testé, mais désactivé par défaut. Pistes
+# restantes, non essayées : tri par date (résultats post-corpus d'abord),
+# `_STOPWORDS_FR` alignée sur `_QE_STOP` (ne plus créditer les mots génériques
+# du champ social) — à mesurer avant d'y toucher.
+F3_MAX_RESULTATS_INTERNET = None  # None ou 0 = désactivé (défaut depuis le 06/09) ; entier = plafond actif
+
+
 def filtrer_resultats_internet(results: list, question: str,
-                               min_commun: int = 2, min_garde: int = 2) -> tuple:
-    """F3 — écarte les résultats internet hors sujet et les doublons.
+                               min_commun: int = 2, min_garde: int = 2,
+                               max_retenus: Optional[int] = F3_MAX_RESULTATS_INTERNET) -> tuple:
+    """F3 — écarte les résultats internet hors sujet et les doublons ; plafonne
+    le reste SI `max_retenus` est activé (entier > 0 — désactivé par défaut,
+    `None`/`0`, depuis que la mesure du 06/09 a réfuté le plafond à 5 sur #5621).
 
     - doublons : même extrait normalisé (boilerplate « 8 nouveaux sites
       universitaires » répété) → un seul conservé ;
     - pertinence : nombre de termes saillants (≥ 4 lettres, hors mots vides)
-      communs entre la question et titre + extrait. Retenu si ≥ `min_commun` ;
-      si moins de `min_garde` résultats passent, on complète avec ceux qui ont
-      au moins 1 terme commun (meilleurs d'abord) ; un résultat sans aucun
-      terme commun n'est jamais retenu — sauf si AUCUN résultat n'en a (la
-      question n'a pas donné de termes exploitables : on garde les 3 premiers).
+      communs entre la question et titre + extrait ;
+    - retenus, triés par ce score décroissant (à score égal : ordre du moteur) :
+      d'abord ceux à ≥ `min_commun` termes communs, plafonnés à `max_retenus`
+      si activé ; si moins de `min_garde` au total, on complète avec les
+      meilleurs à 1 terme commun, toujours sans dépasser le plafond quand il
+      est actif ; un résultat sans aucun terme commun n'est jamais retenu —
+      sauf si AUCUN résultat n'en a (la question n'a donné aucun terme
+      exploitable : on garde les 3 premiers, ou moins si le plafond actif l'exige).
 
-    Renvoie (retenus dans l'ordre d'origine, nombre écartés).
+    Renvoie (retenus dans l'ordre d'origine du moteur, nombre écartés).
     """
     results = list(results or [])
     q_tokens = _tokens_saillants(question)
@@ -2100,19 +2278,24 @@ def filtrer_resultats_internet(results: list, question: str,
             continue
         vus.add(k)
         uniques.append(r)
+    # plafond effectif : max_retenus si activé (entier > 0), sinon "pas de
+    # plafond" — matérialisé par le nombre total de résultats uniques.
+    plafond = max_retenus if max_retenus else len(uniques)
     scores = [len(q_tokens & _tokens_saillants(f"{r.get('title', '')} {r.get('content') or r.get('snippet') or ''}"))
               for r in uniques]
     if not any(scores):
-        kept = uniques[:3]
+        kept = uniques[:min(3, plafond)]
     else:
-        kept = [r for r, s in zip(uniques, scores) if s >= min_commun]
+        # tri stable par score décroissant : à score égal, l'ordre du moteur
+        # (celui de `uniques`) est préservé — pas de nouveau signal introduit.
+        par_score = sorted(range(len(uniques)), key=lambda i: -scores[i])
+        forts = [uniques[i] for i in par_score if scores[i] >= min_commun]
+        kept = forts[:plafond]
         if len(kept) < min_garde:
-            complement = sorted(
-                (r for r, s in zip(uniques, scores) if 0 < s < min_commun and r not in kept),
-                key=lambda r: -scores[uniques.index(r)],
-            )
-            kept += complement[:min_garde - len(kept)]
-            kept = [r for r in uniques if r in kept]  # ordre d'origine
+            place = plafond - len(kept)
+            faibles = [uniques[i] for i in par_score if 0 < scores[i] < min_commun]
+            kept += faibles[:max(0, min(min_garde - len(kept), place))]
+        kept = [r for r in uniques if r in kept]  # ordre d'origine du moteur
     return kept, len(results) - len(kept)
 
 
@@ -2721,6 +2904,44 @@ def compter_placeholders(text: str) -> int:
 
 
 # Appelle l'API Mistral Large pour générer une réponse parlementaire
+# --- F10 : fin de réponse dédoublée / tronquée en plein mot ---
+# Diagnostic (cas #3171, #8922, 05/09) : `finish_reason == "length"` ne veut PAS
+# dire que le texte est visiblement incomplet — le modèle atterrit parfois sur
+# une phrase de clôture propre pile au niveau du plafond de tokens. L'ancien
+# code déclenchait quand même `handle_truncated_response()` sur la seule
+# position du dernier point (« < 100 caractères de la fin »), sans vérifier si
+# la réponse se terminait déjà correctement. Conséquence : on demandait à un
+# second appel de « compléter » un texte déjà fini -> le modèle en tire une
+# suite thématique inventée, sur un sujet différent (#3171 : dérive vers les
+# infirmiers en pratique avancée, hors sujet IBODE) ou une reprise partielle
+# de la dernière phrase (#8922). Cette suite parasite était en plus coupée
+# en plein mot (`max_tokens=60` sur l'appel de complétion, alors que sa propre
+# consigne demande jusqu'à 400 caractères ≈ 100-130 tokens) — d'où le fragment
+# orphelin (« vise à optim. », « "pte. »).
+_PONCTUATION_FIN = (".", "!", "?", "»", '"', ")")
+
+
+def _se_termine_proprement(text: str) -> bool:
+    """Vrai si le texte se termine par une ponctuation de fin de phrase (ou une
+    fermeture usuelle juste après). Décide si une réponse `finish_reason ==
+    "length"` a néanmoins atterri sur une fin propre — auquel cas il ne faut
+    PAS tenter de la « compléter » (F10)."""
+    t = (text or "").rstrip()
+    return bool(t) and t[-1] in _PONCTUATION_FIN
+
+
+def _completion_utilisable(completion: str, tronquee: bool) -> str:
+    """F10 — filet de sécurité sur l'appel de complétion lui-même : s'il a été
+    coupé en plein mot (`tronquee=True` ET ne se termine pas proprement), on le
+    ramène à sa dernière phrase complète plutôt que de laisser un mot tronqué.
+    Chaîne vide si aucune phrase complète n'y figure (rien d'exploitable à
+    ajouter — mieux vaut ne rien ajouter qu'un fragment cassé)."""
+    if not tronquee or _se_termine_proprement(completion):
+        return completion
+    dernier_point = completion.rfind(".")
+    return completion[:dernier_point + 1] if dernier_point > 0 else ""
+
+
 def call_mistral_parliamentary_response(
     prompt: str,
     longueur: str,
@@ -2763,7 +2984,10 @@ def call_mistral_parliamentary_response(
             mistral_response = data["choices"][0]["message"]["content"]
             is_truncated = data["choices"][0].get("finish_reason") == "length"
 
-            if is_truncated:
+            # F10 : ne tenter la complétion que si le texte ne se termine pas
+            # déjà proprement — sinon on demanderait de « compléter » une
+            # réponse finie, ce qui produit une suite parasite hors sujet.
+            if is_truncated and not _se_termine_proprement(mistral_response):
                 try:
                     mistral_response = handle_truncated_response(mistral_response, question, longueur)
                 except Exception as e:
@@ -2785,14 +3009,14 @@ def call_mistral_parliamentary_response(
             else:
                 raise Exception(f"Erreur réseau: {str(e)}")
 
-# Complète une réponse tronquée
+# Complète une réponse tronquée (F10 : appelée seulement quand la réponse ne
+# se termine PAS proprement, cf. _se_termine_proprement — voir le point d'appel)
 def handle_truncated_response(response: str, question: str, longueur: str) -> str:
-    # Gère les réponses tronquées par Mistral.
+    # Le point d'appel garantit que `response` est déjà réellement incomplète :
+    # tout ce qui suit le dernier point est donc le fragment tronqué (F10 —
+    # plus besoin de deviner via une position arbitraire dans le texte).
     last_period = response.rfind('.')
-    if last_period > 0 and last_period < len(response) - 100:
-        incomplete_part = response[last_period+1:]
-    else:
-        incomplete_part = response[-100:]
+    incomplete_part = response[last_period + 1:] if last_period > 0 else response[-150:]
 
     completion_prompt = f"""Complétez UNIQUEMENT la phrase ou le paragraphe en cours, sans titre ni introduction, sans recommencer la réponse.
 
@@ -2813,21 +3037,32 @@ Consignes :
                 "model": "mistral-large-latest",
                 "messages": [{"role": "user", "content": completion_prompt}],
                 "temperature": 0.1,
-                "max_tokens": 60
+                # F10 : 60 tokens (~240 c) contredisaient la consigne « 400
+                # caractères maximum » ci-dessus (≈ 100-130 tokens en français)
+                # -> la complétion elle-même se faisait couper en plein mot.
+                "max_tokens": 150
             },
             timeout=30
         )
         completion_response.raise_for_status()
-        completion = completion_response.json()["choices"][0]["message"]["content"]
+        completion_data = completion_response.json()
+        completion = completion_data["choices"][0]["message"]["content"]
+        completion_truncated = completion_data["choices"][0].get("finish_reason") == "length"
+        # F10 : filet de sécurité si la complétion, malgré le budget relevé,
+        # est quand même coupée en plein mot — on la ramène à sa dernière
+        # phrase complète plutôt que de laisser un fragment cassé.
+        completion = _completion_utilisable(completion, completion_truncated)
 
-        if response.endswith("..."):
+        if not completion:
+            final_response = response
+        elif response.endswith("..."):
             final_response = response[:-3] + completion
         elif response.endswith(" "):
             final_response = response + completion
         else:
             final_response = response + " " + completion
 
-        if not final_response.endswith(('.', '!', '?')):
+        if not _se_termine_proprement(final_response):
             final_response += "."
         return final_response
 
@@ -2957,6 +3192,15 @@ def generate_response(
         current_include_legal = include_legal_articles
         current_model_size = model_size
 
+        # Sous-questions explicitées : calculées ICI (une seule fois) pour pouvoir
+        # distiller la requête fiche (F9, étape 3) ; réutilisées telles quelles
+        # pour le bloc DEMANDES à l'étape 5 (aucun appel Mistral supplémentaire —
+        # avant, ce même appel était refait à l'étape 5).
+        try:
+            subquestions_prompt = extract_subquestions(question)
+        except Exception:
+            subquestions_prompt = []
+
         # Étape 1 : Recherche d'anciennes questions
         parliamentary_context = "Aucun contexte parlementaire trouvé."
         similar_documents = []
@@ -3017,8 +3261,25 @@ def generate_response(
             '<div class="status-message">📄 Recherche dans la base documentaire...</div>',
             unsafe_allow_html=True
         )
-        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=10)  # + extraits de fiches de référence
-        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=0.7, max_docs=16)
+        # F9 : requête fiche distillée, mode débrayable via DISTILLER_REQUETE_FICHE
+        # ("off"/"sujet"/"sujet_sousquestions") — la recherche dans les autres
+        # collections-documents continue sur la question brute (fiche_query
+        # n'affecte que les collections fiche_de_reference*, cf.
+        # search_uploaded_documents).
+        fiche_query = None
+        if DISTILLER_REQUETE_FICHE != "off":
+            try:
+                if DISTILLER_REQUETE_FICHE == "resume":
+                    fiche_query = resumer_requete_fiche(question)
+                else:
+                    _subqs_pour_fiche = (subquestions_prompt
+                                         if DISTILLER_REQUETE_FICHE == "sujet_sousquestions"
+                                         else None)
+                    fiche_query = distiller_requete_fiche(question, _subqs_pour_fiche)
+            except Exception:
+                fiche_query = None
+        uploaded_results = search_uploaded_documents(question, qdrant_client, embedding_model, top_k=10, fiche_query=fiche_query)  # + extraits de fiches de référence
+        uploaded_docs_context = format_uploaded_docs_by_relevance(uploaded_results, min_score=SEUIL_DOC_STANDARD, max_docs=16)
 
         # Étape 4 : Recherche internet
         search_context = "Aucune recherche internet effectuée."
@@ -3058,12 +3319,7 @@ def generate_response(
             unsafe_allow_html=True
         )
 
-        # Sous-questions explicitées, injectées comme « demandes à traiter »
-        # (garantit qu'aucune sous-question n'est laissée sans réponse).
-        try:
-            subquestions_prompt = extract_subquestions(question)
-        except Exception:
-            subquestions_prompt = []
+        # subquestions_prompt calculé à l'étape 1 (F9) — réutilisé tel quel ici.
 
         prompt = build_parlementary_response_prompt(
             question=truncate_text(question, max_tokens=TOKEN_LIMITS[current_model_size]['question']),
@@ -4137,9 +4393,13 @@ else:
 
                                     uploaded_results = response_data.get("uploaded_documents", [])
 
-                                    # Filtrer par score
-                                    min_score = 0.7
-                                    filtered_results = [res for res in uploaded_results if res.get("score", 0) >= min_score]
+                                    # F12 : MÊME règle que l'injection dans le prompt
+                                    # (`extrait_retenu`, clause fiche comprise). Avant,
+                                    # ce filtre était un `>= 0.7` codé en dur sans la
+                                    # clause fiche : un extrait de fiche entre 0,45 et
+                                    # 0,70 était envoyé au modèle sans jamais s'afficher.
+                                    filtered_results = [res for res in uploaded_results
+                                                        if extrait_retenu(res)]
 
                                     if not filtered_results:
                                         st.info("Aucun extrait pertinent trouvé dans les documents uploadés.")
@@ -4157,7 +4417,13 @@ else:
                                                     text_preview = res["text"]
                                                     title = res.get("title") or "N/A"
 
-                                                    st.markdown(f"**Extrait {idx} (score: {score})**")
+                                                    # F12 : distinguer à l'œil un extrait fort
+                                                    # d'un extrait retenu par la seule clause fiche
+                                                    _marginal = extrait_marginal(res)
+                                                    _tag = (" — ⚠️ fiche, sous le seuil standard "
+                                                            f"({SEUIL_DOC_STANDARD:.2f}) : retenu par la clause "
+                                                            "fiche de référence" if _marginal else "")
+                                                    st.markdown(f"**Extrait {idx} (score: {score}){_tag}**")
                                                     st.markdown(text_preview)
                                                     st.markdown(f"**Section :** {title}")
                                                     st.markdown("---")
