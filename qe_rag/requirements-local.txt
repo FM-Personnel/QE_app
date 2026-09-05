@@ -1,0 +1,17 @@
+# Dépendances du backend d'embedding « local » UNIQUEMENT.
+#
+# Volontairement SÉPARÉ de requirements.txt : le backend « endpoint » (service
+# HTTP) n'a pas besoin de cette pile, qui pèse plusieurs Go avec torch. Forcer
+# sentence-transformers dans le fichier principal alourdirait toutes les
+# installations, y compris celles qui n'embarquent pas de modèle.
+#
+#   pip install -r qe_rag/requirements.txt -r qe_rag/requirements-local.txt
+#
+# torch : à installer AVANT, depuis l'index CPU, sinon sentence-transformers
+# tire les wheels CUDA (plusieurs Go inutiles sans GPU) :
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch==2.2.2
+#
+# sentence-transformers tire lui-même transformers, tokenizers et
+# huggingface-hub. C'est la seule dépendance à déclarer : l'app Streamlit, qui
+# charge le MÊME modèle en production, ne liste rien d'autre.
+sentence-transformers>=3.0

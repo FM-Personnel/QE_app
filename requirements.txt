@@ -26,6 +26,13 @@ qdrant-client==1.13.3
 fastembed
 
 # Extraction de documents (upload dans l'app)
+# PyPDF2 : lu par app.py (`from PyPDF2 import PdfReader`).
+# pypdf   : lu par qe_rag/extract.py, qui s'en sert en REPLI quand pdfplumber
+#           echoue sur un PDF. Ce sont deux distributions distinctes -- pypdf
+#           est le successeur renomme de PyPDF2, le nom d'import a change --
+#           donc installer l'une ne fournit PAS l'autre. Sans cette ligne, le
+#           repli levait ImportError au lieu de rattraper le PDF recalcitrant.
 PyPDF2
+pypdf
 python-docx
 pdfplumber

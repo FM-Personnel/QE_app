@@ -22,7 +22,6 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from types import SimpleNamespace
 from PyPDF2 import PdfReader
-from docx import Document
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -355,104 +354,8 @@ class ResponseDocument(BaseModel):
 
 # --- 1a. Fonctions d'upload, d'indexation et d'embedding
 
-# Fonction pour extraire le texte d'un document pdf
-def extract_text(pdf_path: str, max_pages: Optional[int] = None) -> str:
-    """
-    Extrait le texte d'un PDF avec plusieurs stratégies :
-    - pdfplumber pour le texte brut
-    - fallback OCR si une page est vide
-    - nettoyage des espaces et des sauts de ligne
-    """
-    text_chunks = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pages = pdf.pages[:max_pages] if max_pages else pdf.pages
-            for i, page in enumerate(pages, start=1):
-                try:
-                    # Extraction brute
-                    page_text = page.extract_text() or ""
-                    word_count = len(page_text.split()) if page_text else 0
-                    
- #                    # Si vide, tenter une extraction par OCR (optionnel)
- #                    if not page_text.strip():
- #                        try:
- #                            from pdf2image import convert_from_path
- #                            import pytesseract
- #                            images = convert_from_path(pdf_path, first_page=i, last_page=i)
- #                            ocr_text = pytesseract.image_to_string(images[0], lang="fra")
- #                            page_text = ocr_text
- #                            st.write(f"Page {i} → OCR fallback → {len(page_text.split())} mots")
- #                        except Exception as e:
- #                            print(f"⚠️ OCR non disponible pour la page {i}: {e}")
- #                            pass
-                    
-                    # Nettoyage basique
-                    page_text = re.sub(r"\s+", " ", page_text).strip()
-                    
-                    if page_text:
-                        text_chunks.append(page_text)
-                except Exception as e:
-                    print(f"⚠️ Erreur page {i}: {e}")
-                    continue
-    except Exception as e:
-        print(f"❌ Erreur lors de l'ouverture du PDF: {e}")
-        return ""
-    
-    raw_text = "\n\n".join(text_chunks).strip()
-    return raw_text
 
-# Fonction pour extraire le texte d'un document Word
-def extract_text_from_docx(file_path: str) -> str:
-    """Extrait le texte d'un fichier Word."""
-    try:
-        doc = Document(file_path)
-        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-        return text.strip()
-    except Exception as e:
-        st.error(f"❌ Erreur lors de l'extraction du DOCX: {e}")
-        return ""
 
-# Fonction pour nettoyer les textes extraits
-def clean_text(text: str) -> str:
-    """Nettoie le texte extrait d'un PDF administratif en préservant la structure et les données utiles."""
-    lines = text.split('\n')
-    cleaned_lines = []
-
-    for line in lines:
-        line = line.strip()
-
-        # Ignore les lignes vides ou presque vides
-        if not line:
-            continue
-
-        # Ignore les numéros de page isolés (ex: "Page 57" ou "57")
-        if re.match(r'^(?:Page\s*)?\d+\s*$', line, re.IGNORECASE):
-            continue
-
-        # Ignore les en-têtes/pieds de page répétitifs (ex: "PLFSS 2025 - Annexe 7")
-        if re.match(r'^(?:PLFSS\s*\d{4}\s*-\s*Annexe\s*\d+|ANNEXE\s*DÉPENSES\s*DE\s*LA\s*BRANCHE\s*.*|securite-sociale\.fr|Source\s*:?\s*.*|Génération\s*X-Book)$', line, re.IGNORECASE):
-            continue
-
-        # Ignore les lignes avec seulement des caractères spéciaux ou des tirets
-        if re.match(r'^[•○◘\-—~=]+$', line):
-            continue
-
-        # Conserve les lignes même courtes (titres, sous-titres, etc.)
-        cleaned_lines.append(line)
-
-    # Reconstitue le texte
-    text = '\n'.join(cleaned_lines)
-
-    # Nettoyage global
-    text = re.sub(r'\s+', ' ', text)  # Espaces multiples
-    text = re.sub(r'(\w)\s+-\s+(\w)', r'\1\2', text)  # Mots coupés par tiret
-    text = re.sub(r'\bhttps?://\S+', '', text)  # URLs
-    text = re.sub(r'[•○◘]+|[-=~]{5,}', '', text)  # Artefacts visuels
-
-    # Nettoie les espaces résiduels
-    text = text.strip()
-
-    return text
 
 # Fonction de suppression du sommaire
 def remove_summary(text: str) -> str:
@@ -465,255 +368,118 @@ def remove_summary(text: str) -> str:
     )
     return cleaned.strip() if cleaned.strip() else text
 
-# Fonction de pré-traitement des titres
-def preprocess_for_titles(text: str) -> str:
-    """Insère des sauts de ligne avant chaque titre pour améliorer la segmentation."""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    processed_text = []
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        if detect_titles(sentence):
-            processed_text.append(f"\n{sentence}\n")
-        else:
-            processed_text.append(sentence)
-    text = " ".join(processed_text)
 
-    # Ajout de sauts de ligne autour des titres
-    title_patterns = [
-        r"(Article\s*\d*\s*[-–]?)", r"(ANNEXE\s+\d+)", r"(PARTIE\s+\d+)",
-        r"(Fiches?\s+d’?évaluation\s+préalable)", r"(\d+\.\s+)", r"([IVXLCDM]+\.\s+)"
-    ]
-    for pattern in title_patterns:
-        text = re.sub(pattern, r"\n\1\n", text, flags=re.IGNORECASE)
 
-    text = re.sub(r'\n\s*\n', '\n', text)
-    return text.strip()
 
-# Fonction de détection des titres
-def detect_titles(line: str) -> bool:
-    """Détecte les titres de manière robuste."""
-    line = line.strip()
-    if not line:
-        return False
-    regex_patterns = [
-        r"^Article\s+\d+\s*[–—-]?", r"^ANNEXE\s+\d+", r"^PARTIE\s+\d+",
-        r"^(TITRE|Chapitre|Section)\s+\d+", r"^[IVXLCDM]+\.\s+", r"^\d+(\.\d+)*\s+"
-    ]
-    if any(re.match(p, line, flags=re.IGNORECASE) for p in regex_patterns):
-        return True
-    title_keywords = [
-        "Article ", "ANNEXE ", "PARTIE ", "Fiches d’évaluation préalable",
-        "Synthèse", "Conclusion", "TITRE ", "Chapitre ", "Section ",
-        "I. ", "II. ", "III. ", "1. ", "2. "
-    ]
-    return any(keyword.lower() in line.lower() for keyword in title_keywords)
+class _BackendModeleApp:
+    """Expose à `qe_rag` le modèle d'embedding DÉJÀ chargé par l'application.
 
-# Fonction de segmentation du texte
-def segment_text(text: str, max_words: int = 300, min_words: int = 50) -> List[Dict[str, str]]:
-    """Découpe le texte en segments avec titres pour Qdrant."""
-    blocks = re.split(r'\n\n|\.\s+', text)
-    segments = []
-    current_title = "AUTRE"
-    current_content = []
-
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        if detect_titles(block):
-            if current_content:
-                seg_text = ' '.join(current_content)
-                if len(seg_text.split()) >= min_words:
-                    segments.append({"title": current_title, "text": seg_text})
-                current_content = []
-            current_title = block
-        else:
-            current_content.append(block)
-
-    if current_content:
-        seg_text = ' '.join(current_content)
-        if len(seg_text.split()) >= min_words:
-            segments.append({"title": current_title, "text": seg_text})
-
-    return segments
-
-# Fonction pour préparer les chunks
-def prepare_chunks_fixed(text: str, file_name: str, chunk_size=350, overlap=50) -> List[Dict]:
+    Sans cet adaptateur, `qe_rag` instancierait son propre `LocalBackend` et on
+    chargerait un SECOND modèle dans le conteneur Streamlit, à côté du premier.
+    C'était le risque le plus concret de la bascule ; il se règle en dix lignes,
+    `ingest_document` n'attendant qu'un objet qui sache `encode(textes)`.
     """
-    Découpe le texte en chunks fixes (~350 mots ≈ 512 tokens) avec overlap,
-    en conservant le dernier titre détecté comme métadonnée.
-    """
-    words = text.split()
-    chunks = []
-    start = 0
-    current_title = "AUTRE"
 
-    while start < len(words):
-        end = start + chunk_size
-        chunk_words = words[start:end]
+    name = "modele-app"
 
-        # Met à jour le titre courant si un mot ressemble à un titre
-        for w in chunk_words:
-            if detect_titles(w):
-                current_title = w
+    def __init__(self, modele):
+        self._modele = modele
 
-        if len(chunk_words) >= 50:  # filtre chunks trop courts
-            chunk_text = " ".join(chunk_words)
-            chunks.append({
-                "id": str(uuid.uuid4()),
-                "text": chunk_text,
-                "metadata": {
-                    "source": file_name,
-                    "section": current_title,
-                    "position": start,
-                    "word_count": len(chunk_words),
-                    "upload_date": datetime.now().isoformat()
-                }
-            })
-        start += chunk_size - overlap
+    def encode(self, textes):
+        vecteurs = self._modele.encode(list(textes))
+        return vecteurs.tolist() if hasattr(vecteurs, "tolist") else list(vecteurs)
 
-    return chunks
+    def encode_one(self, texte):
+        return self.encode([texte])[0]
 
-# Fonction pour l'upload et l'indexation avec logs détaillés
-def process_and_index_document(file_path: str, file_type: str, collection_name: str,
+
+def process_and_index_document(file_path: str, file_type: str, doc_name: str,
                                qdrant_client=None, embedding_model=None,
                                progress_callback=None):
-    """Traite et indexe un document dans SA PROPRE COLLECTION avec suivi de progression et logs détaillés."""
+    """Ingère un document téléversé via `qe_rag`. Rend le rapport, ou None.
+
+    BASCULE (06/09, décision utilisateur). L'ancien chemin découpait en fenêtres
+    fixes de 350 mots avec recouvrement, sans égard pour la structure. Trois
+    défauts mesurés, tous réglés ici :
+
+      · `section` valait TOUJOURS « AUTRE ». La détection de titre recevait des
+        MOTS isolés alors que tous ses motifs exigent au moins deux jetons —
+        aucun mot seul ne pouvait les satisfaire. Le prompt affichait donc
+        « (Section: AUTRE) » pour chaque extrait téléversé, sans aucune
+        indication de portée, là où F7 a établi que situer un extrait dans sa
+        structure change la façon dont le modèle l'exploite ;
+      · le recouvrement de 50 mots DUPLIQUAIT du texte entre chunks voisins :
+        deux points portaient le même passage et pouvaient remonter tous les
+        deux, consommant du budget de prompt (F16) pour zéro information ;
+      · téléverser deux fois le même document EMPILAIT deux collections, le nom
+        portant un horodatage. C'est le motif exact de l'incident des 50
+        collections ; `recreate=True` remplace désormais par PRÉFIXE, après un
+        upsert réussi et vérifié.
+
+    Le payload est identique des deux côtés (`text` + `source`, `section`,
+    `position`, `word_count`, `upload_date`), et la recherche ne lit que `text`
+    et `section` : **aucune réingestion n'est nécessaire**, les collections déjà
+    en base restent interrogeables à l'identique.
+
+    `qe_rag` extrait aussi le TXT, le HTML et les URL, et refuse un texte trop
+    court (« PDF image ? ») — l'ancien chemin rendait silencieusement False.
+    """
+    # Import PARESSEUX et volontairement local. `qe_rag` vit dans le dépôt et
+    # n'était historiquement PAS déployé avec `app.py` : un import en tête de
+    # module ferait tomber l'application ENTIÈRE s'il manque. Ici, seul l'onglet
+    # d'upload est touché, et il le dit. Aucun coût : `qe_rag` n'importe que de
+    # la bibliothèque standard au niveau module, ses dépendances lourdes
+    # (pdfplumber, python-docx, qdrant_client) étant chargées à l'usage.
     try:
-        # 1. Extraction du texte
-        try:
-            if file_type == "pdf":
-                raw_text = extract_text(file_path)
-            else:
-                raw_text = extract_text_from_docx(file_path)
+        from qe_rag.pipeline import ingest_document
+    except ImportError as e:  # pragma: no cover - dépend du déploiement
+        st.error(
+            "❌ Le module d'ingestion `qe_rag` est absent de ce déploiement : "
+            f"l'ajout de documents est indisponible ({e}). Le reste de "
+            "l'application fonctionne normalement."
+        )
+        return None
 
-            if not raw_text:
-                if progress_callback:
-                    progress_callback(0, 100, "Échec : extraction du texte")
-                return False
-
-            if progress_callback:
-                progress_callback(5, 100, "Extraction du texte terminée")
-
-        except Exception as e:
-            st.error(f"❌ Erreur extraction: {repr(e)}")
-            return False
-
-        # 2. Nettoyage et segmentation
-        try:
-            cleaned_text = clean_text(raw_text)
-
-            segments = segment_text(cleaned_text) or [{"title": "Document", "text": cleaned_text}]
-
-            if progress_callback:
-                progress_callback(10, 100, "Nettoyage et segmentation terminés")
-        except Exception as e:
-            st.error(f"❌ Erreur nettoyage/segmentation: {repr(e)}")
-            return False
-
-        # 3. Pré-traitement titres
-        try:
-            preprocessed_text = preprocess_for_titles(cleaned_text)
-        except Exception as e:
-            st.error(f"❌ Erreur preprocess_for_titles: {repr(e)}")
-            return False        
-
-        # 4. Chunking
-        try:
-            chunks = prepare_chunks_fixed(
-                preprocessed_text,
-                file_name=collection_name,
-                chunk_size=350,   # ≈ 512 tokens
-                overlap=50
-            )
-        except Exception as e:
-            st.error(f"❌ Erreur chunking: {repr(e)}")
-            return False
-
+    def _avance(pct, message):
         if progress_callback:
-            progress_callback(30, 100, f"Préparation des chunks terminée ({len(chunks)} chunks)")
+            progress_callback(pct, 100, message)
 
-        # 5. Génération des embeddings (par petits lots)
-        texts = [chunk["text"] for chunk in chunks]
-        embeddings = []
-        total_chunks = len(chunks)
+    try:
+        # RÉPÉTITION À BLANC D'ABORD : extraction, nettoyage et découpage, sans
+        # toucher à Qdrant ni calculer un seul vecteur. Même filet que le
+        # workflow d'ingestion, et il vaut au moins autant ici, où celui qui
+        # téléverse n'est pas développeur : un PDF image ou un découpage vide se
+        # voit AVANT qu'une collection soit créée.
+        _avance(10, "Extraction et découpage (répétition à blanc)…")
+        essai = ingest_document(file_path, name=doc_name, kind=file_type or None,
+                                dry_run=True)
+        if not essai.ok or essai.n_chunks == 0:
+            st.error(f"❌ Document inexploitable : {essai.error or 'aucun chunk produit'}. "
+                     "Aucune collection n'a été créée.")
+            _avance(0, "Échec avant toute écriture")
+            return None
 
-        for i in range(0, total_chunks, 5):
-            batch_texts = texts[i:i+5]
-            try:
-                batch_embeddings = embedding_model.encode(batch_texts).tolist()
-                embeddings.extend(batch_embeddings)
-            except Exception as e:
-                st.error(f"❌ Erreur génération embeddings: {repr(e)}")
-                if progress_callback:
-                    progress_callback(0, 100, f"Erreur génération embeddings: {str(e)}")
-                return False
+        _avance(40, f"{essai.n_chunks} chunks préparés — indexation…")
+        rapport = ingest_document(
+            file_path, name=doc_name, kind=file_type or None,
+            backend=_BackendModeleApp(embedding_model), qdrant_client=qdrant_client,
+            recreate=True,
+        )
+        _avance(100 if rapport.ok else 0,
+                f"{rapport.n_vectors_upserted} vecteurs indexés" if rapport.ok
+                else f"Échec : {rapport.error}")
+        if not rapport.ok:
+            st.error(f"❌ Échec de l'ingestion : {rapport.error}")
+            for etape in rapport.steps:
+                if not etape.ok:
+                    st.caption(f"· {etape.name} : {etape.detail}")
+        return rapport
 
-            if progress_callback:
-                current_chunk = min(i + 5, total_chunks)
-                progress_callback(30 + int(30 * current_chunk / total_chunks),
-                                  100,
-                                  f"Génération des embeddings : {current_chunk}/{total_chunks}")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"❌ Erreur pendant l'ingestion : {repr(e)}")
+        return None
 
-        # 6. Indexation dans Qdrant (par petits lots avec réessais)
-        points = [
-            models.PointStruct(
-                id=chunk["id"],
-                vector=embedding,
-                payload={"text": chunk["text"], **chunk["metadata"]}
-            )
-            for chunk, embedding in zip(chunks, embeddings)
-        ]
 
-        batch_size = 10
-        max_retries = 2
-        retry_delay = 2
-
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            success = False
-            retry_count = 0
-
-            while retry_count < max_retries and not success:
-                try:
-                    qdrant_client.upsert(
-                        collection_name=collection_name,
-                        points=batch,
-                        wait=True,
-                    )
-                    success = True
-                except Exception as e:
-                    retry_count += 1
-                    st.error(f"⚠️ Erreur upsert batch {i//batch_size+1}: {repr(e)}")
-                    if progress_callback:
-                        progress_callback(0, 100,
-                                          f"Échec batch {i//batch_size + 1}, tentative {retry_count}/{max_retries}")
-                    if retry_count < max_retries:
-                        time.sleep(retry_delay)
-
-            if not success:
-                if progress_callback:
-                    progress_callback(0, 100, f"Échec définitif batch {i//batch_size + 1}")
-                return False
-
-            if progress_callback:
-                current_point = min(i + batch_size, len(points))
-                progress_callback(60 + int(40 * current_point / len(points)),
-                                  100,
-                                  f"Indexation : {current_point}/{len(points)} chunks")
-
-        if progress_callback:
-            progress_callback(100, 100, "Indexation terminée avec succès")
-        st.success("🎉 Document indexé avec succès")
-        return True
-
-    except Exception as e:
-        if progress_callback:
-            progress_callback(0, 100, f"Erreur : {str(e)}")
-        st.error(f"Erreur dans process_and_index_document: {e}")
-        return False
 
 # --- 1b. Fonctions de recherche ---
 
@@ -2220,7 +1986,7 @@ def detecter_texte_publie(titre: str, extrait: str) -> str:
 # ne suggère pas. C'est ce qui écarte le risque d'une question qui affirmerait
 # l'existence du décret et se ferait valider par un rédacteur pressé.
 _QUESTION_DECRET_RE = re.compile(
-    r"d[ée]crets?\s+d(?:'|’)application|d[ée]crets?|mesures?\s+r[ée]glementaires?"
+    r"d[ée]crets?\s+d(?:'|’)application|d[ée]crets?\b|mesures?\s+r[ée]glementaires?"
     r"|textes?\s+d(?:'|’)application|publication\s+du\s+d[ée]cret",
     re.IGNORECASE,
 )
@@ -2248,37 +2014,37 @@ def detecter_point_decret(question: str, legal_context: str,
     if not (pose_par_la_question or prevu_par_un_texte):
         return None
 
-    # Publication attestée ? On réutilise `detecter_texte_publie`, écrite pour
-    # F1 — qui empêchait d'annoncer « en préparation » un texte PUBLIÉ. Ici on
-    # s'en sert au cas symétrique : un texte prévu et NON publié.
+    # ARBITRAGE DE L'UTILISATEUR (06/09) : on demande DANS TOUS LES CAS.
+    # J'avais ajouté une suppression — « une source atteste la publication,
+    # donc rien à demander ». Ma propre mesure lui a retiré son socle :
+    # l'attestation n'est pas rattachée au décret EN CAUSE, la boucle se taisait
+    # dès qu'UN décret publié quelconque apparaissait. On ne peut pas invoquer
+    # « ne pas faire valider ce que les sources établissent » quand les sources
+    # n'établissent pas le bon décret. La suppression est donc retirée.
+    #
+    # CE QUI RESTE, ET POURQUOI : on continue d'OBSERVER une publication
+    # attestée, sans en tirer aucune conséquence sur le comportement. Sans
+    # cette observation, la prédiction à vérifier — « la question nomme la loi,
+    # jamais le décret, donc restreindre reviendrait à ne rien restreindre » —
+    # deviendrait invérifiable au moment précis où l'on demande de la vérifier.
+    # Le champ est purement descriptif ; une ligne à retirer s'il gêne.
+    publication_vue = None
     for res in (search_results or []):
         ref = detecter_texte_publie(res.get("title") or "",
                                     res.get("content") or res.get("snippet") or "")
         if ref and _DECRET_PUBLIE_RE.search(ref):
-            # AJOUT DE MA PART, hors règle de l'utilisateur : si une source dit
-            # le décret publié, il n'y a rien à demander — la réponse est dans
-            # le contexte, et F1 impose déjà de la tenir pour acquise. On ne
-            # fait pas valider à un humain ce que les sources établissent.
-            #
-            # ⚠️ FAUX NÉGATIF CONNU, mesuré : l'attestation n'est PAS rattachée
-            # au décret en cause. Si une source atteste un AUTRE décret publié
-            # pendant que celui de la question reste attendu, on se tait à tort
-            # — exactement le cas que l'utilisateur dit fréquent (les délais de
-            # publication). Rattacher l'attestation au bon décret demanderait de
-            # savoir lequel est visé, ce que la question ne donne presque jamais.
-            # En attendant l'arbitrage : on ne pose pas la question, mais on ne
-            # le TAIT PAS — le motif est journalisé et relevable, pour qu'un
-            # faux négatif se voie au lieu de disparaître.
-            return {"motif": "publication_attestee", "reference": ref, "invite": None}
+            publication_vue = ref
+            break
 
     return {
         "motif": "question" if pose_par_la_question else "texte_prevu",
+        # Observation seule : ne change ni le point posé, ni son texte.
+        "publication_vue": publication_vue,
         "invite": (
             "Le parlementaire interroge sur le décret d'application"
             if pose_par_la_question else
             "Un texte fourni prévoit un décret d'application"
-        ) + ". Aucune source disponible ne le donne comme publié. "
-        "Faut-il indiquer dans la réponse où en est ce décret ? Si oui, "
+        ) + ". Faut-il indiquer dans la réponse où en est ce décret ? Si oui, "
         "précisez-le dans les instructions — l'outil n'a aucune information "
         "sur son avancement, et n'en affirmera aucune.",
     }
@@ -2948,12 +2714,13 @@ def afficher_journal_generation(response_data: dict) -> None:
         if _compl.get("mots_ajoutes"):
             morceaux.append(f"completion_mots={_compl['mots_ajoutes']}")
     if point:
-        # La RÉFÉRENCE, pas seulement le motif : sans elle on compte les
-        # déclenchements de la suppression sans pouvoir vérifier si le décret
-        # attesté est bien celui en cause. C'est le seul chiffre qui départage
-        # « se taire quand une source atteste » de « demander dans tous les cas ».
-        _ref = point.get("reference")
-        morceaux.append(f"point_decret={point['motif']}" + (f"({_ref})" if _ref else ""))
+        # La publication OBSERVÉE, quand il y en a une : c'est elle qui permet
+        # de vérifier si le décret attesté est bien celui en cause, donc de
+        # trancher un jour entre « demander toujours » et « restreindre ».
+        # Elle ne change rien au point posé — il l'est dans tous les cas.
+        _vue = point.get("publication_vue")
+        morceaux.append(f"point_decret={point['motif']}"
+                        + (f"(publication vue : {_vue})" if _vue else ""))
     if diagnostic:
         # Sur une génération échouée, c'est la SEULE trace utile : elle dit où
         # sont passés les tokens, donc si le contexte était vraiment vide.
@@ -2961,7 +2728,7 @@ def afficher_journal_generation(response_data: dict) -> None:
     if not morceaux:
         return
     st.caption("[generation] " + " · ".join(morceaux))
-    if point and point.get("invite"):
+    if point:
         # Une question AU rédacteur : elle doit se voir, pas se relever au grep.
         # Placée sous la réponse et non au-dessus — elle porte sur un point à
         # compléter, pas sur ce qui vient d'être écrit.
@@ -4548,28 +4315,21 @@ else:
                                         st.stop()
 
                         # Créer une collection Qdrant avec suivi d'avancement
-                        collection_name = f"{custom_name.replace(' ', '_')}__{int(datetime.now().timestamp())}"
-
                         progress = st.progress(0)
                         status = st.empty()
 
-                        status.info("📂 Initialisation de la collection...")
-                        progress.progress(10)
-
                         try:
-                            qdrant_client.create_collection(
-                                collection_name=collection_name,
-                                vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE)
-                            )
-                            status.success(f"✅ Collection '{collection_name}' créée.")
-                            progress.progress(30)
-
-                            # Traiter et indexer le document
-                            status.info("📑 Extraction et préparation du texte...")
-                            success = process_and_index_document(
+                            # La collection n'est PLUS créée ici. `qe_rag` la crée
+                            # lui-même, avec son propre nom `<slug>__<horodatage>`,
+                            # et c'est ce qui rend le remplacement par préfixe
+                            # possible : la pré-créer sous un autre nom laisserait
+                            # une collection vide à côté de la vraie, et
+                            # téléverser deux fois empilerait à nouveau — le motif
+                            # de l'incident des 50 collections.
+                            rapport = process_and_index_document(
                                 file_path=tmp_path,
                                 file_type=file_extension,
-                                collection_name=collection_name,
+                                doc_name=custom_name,
                                 qdrant_client=qdrant_client,
                                 embedding_model=embedding_model,
                                 progress_callback=lambda current, total, message: (
@@ -4578,16 +4338,28 @@ else:
                                 )
                             )
 
-                            if success:
+                            if rapport is not None and rapport.ok:
                                 progress.progress(100)
-                                status.success(f"✅ Document ajouté sous le nom '{custom_name}' !")
-                                collection_info = qdrant_client.get_collection(collection_name)
- #                                st.info(f"📊 Nombre de vecteurs indexés : {collection_info.vectors_count}")
-                            else:
+                                status.success(
+                                    f"✅ Document ajouté sous le nom '{custom_name}' — "
+                                    f"{rapport.n_chunks} extraits, collection "
+                                    f"`{rapport.collection}`."
+                                )
+                                # Le découpage est désormais structuré : on montre
+                                # les premières sections retenues, pour que celui
+                                # qui téléverse voie ce que l'outil a compris du
+                                # document au lieu de l'accepter sur parole.
+                                _sections = [c.get("metadata", {}).get("section")
+                                             for c in (rapport.sample_chunks or [])]
+                                _sections = [x for x in _sections if x and x != "AUTRE"]
+                                if _sections:
+                                    st.caption("Sections repérées : "
+                                               + " · ".join(dict.fromkeys(_sections)))
+                            elif rapport is not None:
                                 status.error("❌ Échec du traitement.")
 
                         except Exception as e:
-                            st.error(f"❌ Erreur lors de la récupération des collections : {e}")
+                            st.error(f"❌ Erreur pendant l'ajout du document : {e}")
 
                 except Exception as e:
                     st.error(f"❌ Echec du traitement du document {e}")

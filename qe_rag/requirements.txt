@@ -1,0 +1,23 @@
+# Dépendances du pipeline d'ingestion (indépendantes de l'app Streamlit).
+#   pip install -r qe_rag/requirements.txt
+#
+# Cœur (toujours) :
+qdrant-client>=1.12
+requests>=2.31
+numpy>=1.26
+
+# Extraction :
+pdfplumber>=0.11        # PDF (fallback pypdf inclus)
+pypdf>=4.0
+python-docx>=1.1        # DOCX
+trafilatura>=1.8        # HTML — extraction principale
+readability-lxml>=0.8   # HTML — repli
+beautifulsoup4>=4.12    # HTML — repli
+lxml>=5.0
+
+# Backend d'embedding 'local' : voir qe_rag/requirements-local.txt.
+# NE PAS le décommenter ici — c'était un commentaire, donc jamais installé, et
+# le workflow d'ingestion a échoué là-dessus au premier lancement réel. La
+# dépendance est maintenant DÉCLARÉE dans un fichier à part, installable :
+#   pip install -r qe_rag/requirements.txt -r qe_rag/requirements-local.txt
+# Le backend 'endpoint' n'en a pas besoin, d'où la séparation.
