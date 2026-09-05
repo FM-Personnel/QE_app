@@ -2846,14 +2846,21 @@ def afficher_journal_generation(response_data: dict) -> None:
     # Une réduction de contexte se signale MÊME sans journal : c'est elle qui
     # change la réponse, et la taire serait le défaut qu'on corrige ailleurs.
     reduction = meta.get("reduction_contexte")
+    diagnostic = meta.get("diagnostic")
     morceaux = [f"{etiquette}={gen[cle]}" for cle, etiquette in _CHAMPS_JOURNAL
                 if gen.get(cle) is not None]
-    if not morceaux and not reduction:
+    if not morceaux and not reduction and not meta.get("diagnostic"):
         return
     if reduction:
         retire = ", ".join(f"{k}:{v}" for k, v in (reduction.get("retire") or {}).items())
         morceaux.append(f"contexte_reduit={reduction.get('avant')}->{reduction.get('apres')}")
         morceaux.append(f"entrees_retirees=[{retire}]")
+    if diagnostic:
+        # Sur une génération échouée, c'est la SEULE trace utile : elle dit où
+        # sont passés les tokens, donc si le contexte était vraiment vide.
+        morceaux.append("[tokens] " + " · ".join(f"{k}={v}" for k, v in diagnostic.items()))
+    if not morceaux:
+        return
     st.caption("[generation] " + " · ".join(morceaux))
     if reduction:
         # Visible à l'œil, pas seulement au grep : la réponse ci-dessus a été
@@ -2863,6 +2870,26 @@ def afficher_journal_generation(response_data: dict) -> None:
                    f"qu'avec le contexte complet ({retire}).")
     with st.expander("Journal de génération (détail)"):
         st.json(gen if not reduction else {**gen, "reduction_contexte": reduction})
+
+
+def _decompte_tokens_prompt(question, parlementaire, juridique, documents, internet) -> dict:
+    """Où passent les tokens du prompt, bloc par bloc.
+
+    Écrit dans les métadonnées du chemin d'ERREUR : c'est là qu'on en a besoin,
+    et c'est précisément là qu'il n'y avait rien. Sur #10270 il a fallu
+    reconstruire ce décompte à la main pour établir que le contexte ne pouvait
+    pas être vide — un calcul que l'app pouvait faire elle-même.
+    """
+    blocs = {
+        "systeme": estimate_tokens(SYSTEME_REPONSE_PARLEMENTAIRE),
+        "question": estimate_tokens(question or ""),
+        "contexte_parlementaire": estimate_tokens(parlementaire or ""),
+        "textes_juridiques": estimate_tokens(juridique or ""),
+        "documents_reference": estimate_tokens(documents or ""),
+        "recherche_internet": estimate_tokens(internet or ""),
+    }
+    blocs["total_blocs"] = sum(blocs.values())
+    return blocs
 
 
 # --- F16 : dégrader le contexte plutôt que refuser la génération -------------
@@ -3011,6 +3038,7 @@ def build_parlementary_response_prompt(
     custom_instructions: str,
     search_context: str,
     subquestions: Optional[List[str]] = None,
+    consignes_sous_questions: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Construit le message `user` : question, contexte récupéré (parlementaire,
@@ -3077,6 +3105,24 @@ def build_parlementary_response_prompt(
     else:
         demandes = "Déduire les demandes de la question elle-même."
 
+    # Consignes saisies par le rédacteur pour une sous-question précise. Elles
+    # peuvent porter une information NON PUBLIQUE (décret en cours de rédaction,
+    # effectif non encore publié) : c'est le canal prévu pour ça, et l'outil ne
+    # peut pas la connaître autrement. On les donne donc comme des éléments
+    # établis — mais on borne cette autorité au point visé, pour qu'elle ne
+    # serve pas de laissez-passer général contre les règles d'exactitude.
+    if consignes_sous_questions:
+        _lignes = "\n".join(f"- Pour « {sq} » : {c}"
+                             for sq, c in consignes_sous_questions.items())
+        consignes_line = (
+            "\nCONSIGNES DU RÉDACTEUR, PAR SOUS-QUESTION — elles émanent de "
+            "l'administration et peuvent porter une information non encore "
+            "publique. Tenez-les pour établies et suivez-les sur le point "
+            "qu'elles visent ; elles ne dispensent d'aucune règle d'exactitude "
+            "pour le reste de la réponse.\n" + _lignes + "\n")
+    else:
+        consignes_line = ""
+
     custom_line = (
         f"- Instruction spécifique impérative : {custom_instructions}\n"
         if custom_instructions else ""
@@ -3089,7 +3135,7 @@ QUESTION DU PARLEMENTAIRE
 
 DEMANDES À TRAITER — traitez chacune, dans cet ordre. Si le contexte fourni ne permet pas de répondre précisément à une demande, indiquez-le (renvoi au cadre général, mesure à l'étude, temporisation) — n'avancez jamais un chiffre, une date ou un texte non étayé pour combler.
 {demandes}
-
+{consignes_line}
 CONTEXTE PARLEMENTAIRE — réponses ministérielles antérieures à des questions proches. Registre, ton et axes d'argumentation. Une entrée marquée « TRAME FACTUELLE ADMISSIBLE » (proximité élevée, récente, même législature) et portant sur le même texte / dispositif que la question peut fournir l'enchaînement des faits, à recouper avec les autres contextes ; une entrée « registre seulement » n'apporte que le ton.
 {parliamentary_context}
 
@@ -3429,12 +3475,21 @@ def generate_response(
     longueur: str = "Courte (300 mots)",
     response_orientation: str = "Répondre de façon neutre",
     custom_instructions: str = "",
+    consignes_sous_questions: Optional[Dict[str, str]] = None,
     include_legal_articles: bool = False,
     must_contain: str = "",
     max_legal_articles: int = 3,
     model_size: str = "small"
 ):
     try:
+        # F18 : ces variables sont initialisées AVANT tout travail, pour que le
+        # chemin d'erreur puisse rapporter ce qui avait déjà été récupéré. Sans
+        # ça, une exception renvoyait un dictionnaire vide : les quatre onglets
+        # de contexte affichaient « aucun … trouvé » alors que le contexte
+        # existait, et le diagnostic partait sur une fausse piste (#10270).
+        similar_documents, legal_sources, search_results, uploaded_results = [], [], [], []
+        parliamentary_context = legal_context = uploaded_docs_context = search_context = ""
+
         status_placeholder = st.empty()
 
         # Limites de tokens pour Mistral Large
@@ -3610,6 +3665,7 @@ def generate_response(
                 longueur=current_longueur,
                 response_orientation=current_orientation,
                 custom_instructions=custom_instructions,
+                consignes_sous_questions=consignes_sous_questions,
                 subquestions=subquestions_prompt,
                 **blocs,
             )
@@ -3675,17 +3731,30 @@ def generate_response(
         }
 
     except Exception as e:
+        # F18 : une erreur ne doit pas effacer les pièces du dossier. L'ancien
+        # dictionnaire renvoyait des listes vides et omettait `search_results` et
+        # `uploaded_documents` : les onglets affichaient alors « aucun … trouvé »
+        # QUEL QUE SOIT le contexte réellement récupéré. Sur #10270 ça a fait
+        # croire à un prompt de 14 591 tokens sans contexte — impossible, le
+        # plancher (système + squelette + question) vaut ~2 900 tokens.
         return {
             "question": question,
             "response": f"Erreur lors de la génération de la réponse : {str(e)}",
             "error": str(e),
-            "legal_sources": [],
-            "similar_documents": [],
+            "legal_sources": legal_sources,
+            "similar_documents": similar_documents,
+            "search_results": search_results,
+            "uploaded_documents": uploaded_results,
             "metadata": {
                 "status": "error",
                 "timestamp": datetime.now(pytz.timezone('Europe/Paris')).isoformat(),
                 "legislature": legislature,
-                "rubrique": rubrique
+                "rubrique": rubrique,
+                # Où sont passés les tokens : la question que le diagnostic pose
+                # en premier, et à laquelle rien ne répondait.
+                "diagnostic": _decompte_tokens_prompt(
+                    question, parliamentary_context, legal_context,
+                    uploaded_docs_context, search_context),
             }
         }
 
@@ -4364,6 +4433,15 @@ else:
         if st.session_state["question_input"] != st.session_state["last_question"]:
             st.session_state["last_question"] = st.session_state["question_input"]
             st.session_state.pop("subquestions", None)
+            # Les consignes suivent la sous-question qu'elles visaient. Les
+            # garder les ferait réapparaître, pré-remplies, sur la décomposition
+            # d'une AUTRE question — Streamlit restaure un champ depuis sa clé —
+            # donc rattachées au mauvais point. Le défaut était inerte tant que
+            # `instructions_sq_*` n'était lu nulle part ; depuis F19 il serait
+            # réellement envoyé au modèle. Corriger l'un obligeait à corriger
+            # l'autre.
+            for _cle in [k for k in st.session_state if str(k).startswith("instructions_sq_")]:
+                st.session_state.pop(_cle, None)
 
         # Initialisation des variables des boutons (pour éviter NameError)
         search_button = False
@@ -4404,6 +4482,7 @@ else:
             include_legal_articles = True
             must_contain = ""
             custom_instructions = ""
+            consignes_sous_questions: dict = {}
 
             with st.expander("⚙️ Options avancées"):
 
@@ -4479,6 +4558,24 @@ else:
                                     if i == 1 else ""
                                 ),
                             )
+
+                    # Les consignes sont relevées ICI et transmises à la
+                    # génération. Avant, `instructions_sq_*` n'était lu NULLE
+                    # PART : l'interface promettait « des consignes distinctes »
+                    # et jetait ce que le rédacteur y écrivait — y compris une
+                    # information non publique, alors que c'est le seul canal
+                    # légitime pour en apporter.
+                    #
+                    # On indexe par le TEXTE de la sous-question, pas par son
+                    # rang : la génération recalcule sa propre liste, qui peut
+                    # différer de celle affichée ici. Un appariement par numéro
+                    # attribuerait alors une consigne à la mauvaise
+                    # sous-question — défaut voisin, qualifié séparément, pas
+                    # encore corrigé.
+                    for i, sq in enumerate(st.session_state["subquestions"], start=1):
+                        _consigne = (st.session_state.get(f"instructions_sq_{i}") or "").strip()
+                        if _consigne:
+                            consignes_sous_questions[sq] = _consigne
 
                 st.markdown("---")
 
@@ -4582,6 +4679,7 @@ else:
                         longueur=longueur,
                         response_orientation=response_orientation,
                         custom_instructions=custom_instructions,
+                        consignes_sous_questions=consignes_sous_questions,
                         include_legal_articles=include_legal_articles,
                         must_contain=must_contain if include_legal_articles else "",
                         max_legal_articles=detail_juridique,
