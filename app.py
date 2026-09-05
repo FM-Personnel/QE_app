@@ -2205,6 +2205,85 @@ def detecter_texte_publie(titre: str, extrait: str) -> str:
     return " ".join(ref.group(0).split()) if ref else parution.group(0)
 
 
+# --- Décret d'application : demander au rédacteur, jamais deviner (F15) -------
+# L'outil ne peut pas savoir où en est un décret : cette information n'est
+# souvent pas publique (`note_rag_et_sens_de_reponse.md` § 4). Il ne doit donc
+# ni l'inventer — c'est la fabrication de processus de F15 — ni se taire quand
+# le rédacteur, lui, la détient. Il demande.
+#
+# QUAND A-T-IL LE DROIT DE DEMANDER ? Règle de l'utilisateur (06/09), lecture
+# PERMISSIVE confirmée par lui : « OU veut dire OU, pas ET, donc il faut une
+# seule des deux conditions » —
+#   1. le parlementaire évoque lui-même le décret, OU
+#   2. un texte fourni prévoit un décret dont rien n'atteste la publication.
+# Dans les deux cas la question est fondée sur le MATÉRIAU : l'outil relaie, il
+# ne suggère pas. C'est ce qui écarte le risque d'une question qui affirmerait
+# l'existence du décret et se ferait valider par un rédacteur pressé.
+_QUESTION_DECRET_RE = re.compile(
+    r"d[ée]crets?\s+d(?:'|’)application|d[ée]crets?|mesures?\s+r[ée]glementaires?"
+    r"|textes?\s+d(?:'|’)application|publication\s+du\s+d[ée]cret",
+    re.IGNORECASE,
+)
+# « la loi renvoie à un décret » : les tournures normatives, pas une simple
+# mention. On veut le cas où le législateur a PRÉVU un texte d'application.
+_DECRET_PREVU_RE = re.compile(
+    r"par\s+d[ée]cret|d[ée]cret\s+en\s+Conseil\s+d(?:'|’)[EÉ]tat"
+    r"|(?:fix[ée]e?s?|d[ée]termin[ée]e?s?|pr[ée]cis[ée]e?s?|d[ée]fini[ee]?s?)\s+"
+    r"(?:par|dans\s+les\s+conditions\s+(?:pr[ée]vues\s+)?par)\s+d[ée]cret",
+    re.IGNORECASE,
+)
+_DECRET_PUBLIE_RE = re.compile(r"d[ée]cret", re.IGNORECASE)
+
+
+def detecter_point_decret(question: str, legal_context: str,
+                          search_results: Optional[List[Dict]] = None) -> Optional[Dict]:
+    """Faut-il interroger le rédacteur sur l'avancement d'un décret ?
+
+    Rend un dictionnaire décrivant le point à soumettre, ou None. Aucun appel
+    réseau, aucun appel modèle : tout est déjà en mémoire au moment où le prompt
+    se construit.
+    """
+    pose_par_la_question = bool(_QUESTION_DECRET_RE.search(question or ""))
+    prevu_par_un_texte = bool(_DECRET_PREVU_RE.search(legal_context or ""))
+    if not (pose_par_la_question or prevu_par_un_texte):
+        return None
+
+    # Publication attestée ? On réutilise `detecter_texte_publie`, écrite pour
+    # F1 — qui empêchait d'annoncer « en préparation » un texte PUBLIÉ. Ici on
+    # s'en sert au cas symétrique : un texte prévu et NON publié.
+    for res in (search_results or []):
+        ref = detecter_texte_publie(res.get("title") or "",
+                                    res.get("content") or res.get("snippet") or "")
+        if ref and _DECRET_PUBLIE_RE.search(ref):
+            # AJOUT DE MA PART, hors règle de l'utilisateur : si une source dit
+            # le décret publié, il n'y a rien à demander — la réponse est dans
+            # le contexte, et F1 impose déjà de la tenir pour acquise. On ne
+            # fait pas valider à un humain ce que les sources établissent.
+            #
+            # ⚠️ FAUX NÉGATIF CONNU, mesuré : l'attestation n'est PAS rattachée
+            # au décret en cause. Si une source atteste un AUTRE décret publié
+            # pendant que celui de la question reste attendu, on se tait à tort
+            # — exactement le cas que l'utilisateur dit fréquent (les délais de
+            # publication). Rattacher l'attestation au bon décret demanderait de
+            # savoir lequel est visé, ce que la question ne donne presque jamais.
+            # En attendant l'arbitrage : on ne pose pas la question, mais on ne
+            # le TAIT PAS — le motif est journalisé et relevable, pour qu'un
+            # faux négatif se voie au lieu de disparaître.
+            return {"motif": "publication_attestee", "reference": ref, "invite": None}
+
+    return {
+        "motif": "question" if pose_par_la_question else "texte_prevu",
+        "invite": (
+            "Le parlementaire interroge sur le décret d'application"
+            if pose_par_la_question else
+            "Un texte fourni prévoit un décret d'application"
+        ) + ". Aucune source disponible ne le donne comme publié. "
+        "Faut-il indiquer dans la réponse où en est ce décret ? Si oui, "
+        "précisez-le dans les instructions — l'outil n'a aucune information "
+        "sur son avancement, et n'en affirmera aucune.",
+    }
+
+
 def _domaine_de(url: str) -> str:
     m = re.match(r"https?://(?:www\.)?([^/]+)", url or "")
     return m.group(1) if m else ""
@@ -2829,6 +2908,11 @@ _CHAMPS_JOURNAL = (
     ("prompt_tokens", "prompt_tokens"),
     ("limite_prompt", "limite_prompt"),
     ("marge_prompt", "marge_prompt"),
+    # Vérité terrain de l'API, à côté de notre estimation : c'est la seule façon
+    # de savoir si `estimate_tokens` (len//4) sous-compte, donc si le garde-fou
+    # et la dégradation F16 travaillent sur un chiffre juste.
+    ("tokens_api", "tokens_api"),
+    ("ecart_tokens", "ecart_tokens"),
 )
 
 
@@ -2847,14 +2931,29 @@ def afficher_journal_generation(response_data: dict) -> None:
     # change la réponse, et la taire serait le défaut qu'on corrige ailleurs.
     reduction = meta.get("reduction_contexte")
     diagnostic = meta.get("diagnostic")
+    point = meta.get("point_decret")
     morceaux = [f"{etiquette}={gen[cle]}" for cle, etiquette in _CHAMPS_JOURNAL
                 if gen.get(cle) is not None]
-    if not morceaux and not reduction and not meta.get("diagnostic"):
+    if not morceaux and not reduction and not diagnostic and not point:
         return
     if reduction:
         retire = ", ".join(f"{k}:{v}" for k, v in (reduction.get("retire") or {}).items())
         morceaux.append(f"contexte_reduit={reduction.get('avant')}->{reduction.get('apres')}")
         morceaux.append(f"entrees_retirees=[{retire}]")
+    _compl = gen.get("completion")
+    if _compl:
+        etat = ("echec" if _compl.get("erreur")
+                else "retenue" if _compl.get("retenue") else "ecartee")
+        morceaux.append(f"completion={etat}")
+        if _compl.get("mots_ajoutes"):
+            morceaux.append(f"completion_mots={_compl['mots_ajoutes']}")
+    if point:
+        # La RÉFÉRENCE, pas seulement le motif : sans elle on compte les
+        # déclenchements de la suppression sans pouvoir vérifier si le décret
+        # attesté est bien celui en cause. C'est le seul chiffre qui départage
+        # « se taire quand une source atteste » de « demander dans tous les cas ».
+        _ref = point.get("reference")
+        morceaux.append(f"point_decret={point['motif']}" + (f"({_ref})" if _ref else ""))
     if diagnostic:
         # Sur une génération échouée, c'est la SEULE trace utile : elle dit où
         # sont passés les tokens, donc si le contexte était vraiment vide.
@@ -2862,6 +2961,11 @@ def afficher_journal_generation(response_data: dict) -> None:
     if not morceaux:
         return
     st.caption("[generation] " + " · ".join(morceaux))
+    if point and point.get("invite"):
+        # Une question AU rédacteur : elle doit se voir, pas se relever au grep.
+        # Placée sous la réponse et non au-dessus — elle porte sur un point à
+        # compléter, pas sur ce qui vient d'être écrit.
+        st.info("📄 **Point à compléter, si vous le savez.** " + point["invite"])
     if reduction:
         # Visible à l'œil, pas seulement au grep : la réponse ci-dessus a été
         # produite sur un contexte amputé, et le lecteur doit le savoir.
@@ -3264,6 +3368,13 @@ def call_mistral_parliamentary_response(
 
             mistral_response = data["choices"][0]["message"]["content"]
             finish_reason = data["choices"][0].get("finish_reason")
+            # L'API renvoie ses propres compteurs (`usage.prompt_tokens`). Lu
+            # défensivement : s'ils sont absents, le journal l'affichera par un
+            # champ vide plutôt que de faire échouer la génération — et ce
+            # silence sera lui-même l'information (je n'ai pas pu vérifier leur
+            # présence depuis ce poste sans consommer un appel).
+            _usage = data.get("usage") or {}
+            _tokens_api = _usage.get("prompt_tokens")
             is_truncated = finish_reason == "length"
             # Mesure (F10 / chiffrage max_tokens) : sans cette trace, impossible
             # de vérifier qu'un relèvement de `max_tokens` fait bien baisser le
@@ -3271,7 +3382,8 @@ def call_mistral_parliamentary_response(
             _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens,
                                        mistral_response,
                                        prompt_tokens=prompt_tokens,
-                                       limite_prompt=max_allowed_prompt_tokens)
+                                       limite_prompt=max_allowed_prompt_tokens,
+                                       tokens_api=_tokens_api)
 
             # F10 : ne tenter la complétion que si le texte ne se termine pas
             # déjà proprement — sinon on demanderait de « compléter » une
@@ -3305,8 +3417,32 @@ def call_mistral_parliamentary_response(
 _JOURNAL_FINISH_REASON_MAX = 200
 
 
+def _journaliser_completion(**infos) -> None:
+    """Attache la trace du SECOND appel à l'entrée de génération en cours.
+
+    Pourquoi compléter l'entrée existante plutôt que d'en créer une : la
+    complétion ne se déclenche pas à chaque génération. Un journal séparé dont
+    on lirait la dernière ligne renverrait la complétion d'un run PRÉCÉDENT sur
+    une génération qui n'en a pas eu — le défaut F14 transposé aux métadonnées.
+    Ici la correspondance est structurelle.
+
+    Sans cette trace, `metadata["generation"]` ne décrivait que le premier appel
+    et l'instrument était muet **sur le chemin où vivent F10 et F13** — c'est-à-
+    dire là où on en a besoin. C'est aussi le dénominateur qui manque à F13 :
+    combien de fois la complétion se déclenche, et ce qu'elle produit.
+    """
+    try:
+        journal = st.session_state.get("journal_finish_reason") or []
+        if journal:
+            journal[-1]["completion"] = infos
+    except Exception:  # noqa: BLE001 — une trace ne casse jamais une génération
+        pass
+    print("[completion] " + " ".join(f"{k}={v}" for k, v in infos.items()))
+
+
 def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, texte,
-                               prompt_tokens=None, limite_prompt=None) -> None:
+                               prompt_tokens=None, limite_prompt=None,
+                               tokens_api=None) -> None:
     entree = {
         "horodatage": datetime.now(pytz.timezone("Europe/Paris")).isoformat(),
         "finish_reason": finish_reason,
@@ -3328,6 +3464,12 @@ def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, 
         "limite_prompt": limite_prompt,
         "marge_prompt": (None if prompt_tokens is None or limite_prompt is None
                          else limite_prompt - prompt_tokens),
+        # Vérité terrain, quand l'API la donne. `ecart_tokens` POSITIF = notre
+        # estimation SOUS-COMPTE, donc le garde-fou laisse passer des prompts
+        # plus lourds qu'il ne croit : c'est le sens dangereux.
+        "tokens_api": tokens_api,
+        "ecart_tokens": (None if tokens_api is None or prompt_tokens is None
+                         else tokens_api - prompt_tokens),
     }
     try:
         journal = st.session_state.setdefault("journal_finish_reason", [])
@@ -3338,7 +3480,8 @@ def _journaliser_finish_reason(finish_reason, longueur, model_size, max_tokens, 
     print(f"[generation] finish_reason={finish_reason} longueur={longueur!r} "
           f"modele={model_size} max_tokens={max_tokens} "
           f"mots={entree['mots']} fin_propre={entree['fin_propre']} "
-          f"prompt_tokens={prompt_tokens} limite_prompt={limite_prompt}")
+          f"prompt_tokens={prompt_tokens} limite_prompt={limite_prompt} "
+          f"tokens_api={tokens_api} ecart_tokens={entree['ecart_tokens']}")
 
 
 # Complète une réponse tronquée (F10 : appelée seulement quand la réponse ne
@@ -3385,6 +3528,19 @@ Consignes :
         # phrase complète plutôt que de laisser un fragment cassé.
         completion = _completion_utilisable(completion, completion_truncated)
 
+        # Ce que personne ne mesurait : la complétion a-t-elle été RETENUE ou
+        # écartée par le filet de sécurité ? C'est l'information qui manque pour
+        # trancher F13 — un raccord illisible vient d'une complétion retenue,
+        # pas d'une complétion écartée.
+        _journaliser_completion(
+            tentee=True,
+            finish_reason=completion_data["choices"][0].get("finish_reason"),
+            coupee=completion_truncated,
+            retenue=bool(completion),
+            mots_ajoutes=len((completion or "").split()),
+            tokens_api=(completion_data.get("usage") or {}).get("prompt_tokens"),
+        )
+
         if not completion:
             final_response = response
         elif response.endswith("..."):
@@ -3399,6 +3555,7 @@ Consignes :
         return final_response
 
     except Exception as e:
+        _journaliser_completion(tentee=True, retenue=False, erreur=type(e).__name__)
         st.warning(f"⚠️ Impossible de compléter la réponse tronquée: {str(e)}")
         return response + " (réponse incomplète)"
 
@@ -3666,6 +3823,10 @@ def generate_response(
 
         # subquestions_prompt calculé à l'étape 1 (F9) — réutilisé tel quel ici.
 
+        # F15 : le point « décret » se calcule ici, une fois le contexte
+        # juridique et internet connus, et sans aucun appel supplémentaire.
+        point_decret = detecter_point_decret(question, legal_context, search_results)
+
         # F16 : la limite dépend de la longueur demandée, puisque la fenêtre du
         # modèle porte le prompt ET la réponse. On la calcule ici pour pouvoir
         # dégrader AVANT l'appel, pendant que les blocs sont encore séparés —
@@ -3727,6 +3888,9 @@ def generate_response(
             # dernière trace de génération (finish_reason, mots, fin propre) —
             # remontée dans les métadonnées pour être lisible par la boucle d'éval
             "generation": (st.session_state.get("journal_finish_reason") or [{}])[-1],
+            # F15 : point à soumettre au rédacteur (avancement d'un décret),
+            # None quand rien ne le fonde dans le matériau.
+            "point_decret": point_decret,
             # F16 : ce qui a été retiré du contexte pour tenir dans la fenêtre.
             # None dans le cas normal — sa présence signale une réponse produite
             # sur contexte réduit, donc moins précise qu'elle n'aurait pu l'être.
