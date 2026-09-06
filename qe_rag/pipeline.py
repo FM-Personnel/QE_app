@@ -130,12 +130,29 @@ def ingest_document(
         # suppression par nom exact ne trouvait jamais rien et les versions
         # s'empilaient. Fait ICI, après un upsert réussi et vérifié : la version
         # précédente reste servie tant que la nouvelle n'est pas en place.
-        if recreate and ok_count:
-            remplacees = _q.supprimer_versions_precedentes(qdrant_client, doc_name, sauf=coll)
-            if remplacees:
-                rep.step("remplacement", True,
-                         f"{len(remplacees)} version(s) précédente(s) supprimée(s) : "
-                         f"{', '.join(remplacees)}")
+        #
+        # ⚠️ « VÉRIFIÉ » VEUT DIRE POSITIVEMENT VÉRIFIÉ. `count()` avale toute
+        # exception et rend `None` ; `ok_count` traitait ce `None` comme un
+        # succès, si bien qu'un comptage illisible faisait détruire la version
+        # précédente SANS qu'aucune vérification n'ait eu lieu — un contrôle qui
+        # ne peut pas échouer. On exige donc un compte lu ET suffisant.
+        #
+        # Et la branche `else` n'est pas décorative : sauter la suppression en
+        # silence, c'est le MÊME défaut inversé — l'empilement des versions
+        # revient, tout aussi invisible. Le cas dégradé doit être bruyant.
+        if recreate:
+            compte_verifie = got is not None and got >= sent
+            if compte_verifie:
+                remplacees = _q.supprimer_versions_precedentes(qdrant_client, doc_name,
+                                                               sauf=coll)
+                if remplacees:
+                    rep.step("remplacement", True,
+                             f"{len(remplacees)} version(s) précédente(s) supprimée(s) : "
+                             f"{', '.join(remplacees)}")
+            else:
+                rep.step("remplacement", False,
+                         "comptage post-upsert illisible : versions précédentes "
+                         "CONSERVÉES (empilement possible, à vérifier)")
         rep.ok = ok_count
         if not ok_count:
             rep.error = f"comptage post-upsert {got} < {sent} envoyés"
