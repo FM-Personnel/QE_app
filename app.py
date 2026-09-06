@@ -470,9 +470,15 @@ def process_and_index_document(file_path: str, file_type: str, doc_name: str,
                 else f"Échec : {rapport.error}")
         if not rapport.ok:
             st.error(f"❌ Échec de l'ingestion : {rapport.error}")
-            for etape in rapport.steps:
-                if not etape.ok:
-                    st.caption(f"· {etape.name} : {etape.detail}")
+        # Les étapes en échec s'affichent MÊME QUAND L'INGESTION RÉUSSIT. Une
+        # ingestion peut aboutir en ayant sauté le remplacement des versions
+        # précédentes — comptage post-upsert illisible : les documents sont bien
+        # indexés, mais l'ancienne version reste en base. Ne l'afficher que sur
+        # échec global rendrait ce cas invisible, et l'empilement de collections
+        # est précisément ce que la bascule a corrigé.
+        for etape in rapport.steps:
+            if not etape.ok:
+                st.warning(f"⚠️ {etape.name} : {etape.detail}")
         return rapport
 
     except Exception as e:  # noqa: BLE001
@@ -2000,9 +2006,128 @@ _DECRET_PREVU_RE = re.compile(
 )
 _DECRET_PUBLIE_RE = re.compile(r"d[ée]cret", re.IGNORECASE)
 
+# ─── Contrôle « le décret annoncé est-il déjà pris ? » — RÉGLAGE INERTE ────────
+#
+# PISTE DE L'UTILISATEUR (06/09) : « il y a les décrets liés aux articles de loi.
+# Ça m'étonne que dans deux tiers des cas un décret soit annoncé ET aucun décret
+# ne soit trouvé. » Vérifié : il a raison. La partie réglementaire est dans la
+# base (CASF : 3 093 points réglementaires contre 1 162 législatifs), et sur les
+# 17 articles porteurs d'une clause « fixé par décret », **12 ont leur article
+# réglementaire exact** dans le corpus. Le décret annoncé est, le plus souvent,
+# déjà pris et codifié dans la base que l'outil vient d'interroger.
+#
+# CE QUE LE CONTRÔLE MESURERAIT (jointure sur 332 contextes du reference-set) :
+# le déclenchement total passerait de 66 % à ~44 % des générations.
+#
+# ⚠️ POURQUOI IL RESTE INERTE, ET CE N'EST PAS UNE PRÉCAUTION DE FORME.
+# Le contrôle répond à « cette matière est-elle réglementée ? » et NON à « le
+# décret annoncé par CETTE clause a-t-il été pris ? ». La preuve est dans les
+# données : `R232-4` existe, mais son propre `base_legislative` pointe vers
+# `L232-2` — le numéro réglementaire reflète la MATIÈRE, pas un lien formel
+# d'application. Un chapitre peut avoir des dispositions appliquées et d'autres
+# en attente. Le contrôle supprimera donc des cas légitimes, et l'asymétrie des
+# coûts joue contre lui : une question de trop se ferme d'un coup d'œil, une
+# question NON posée laisse passer un décret dont la réponse ne dira rien.
+#
+# D'où : test par NUMÉRO EXACT seul (présomption forte, 12/17), et pas l'union
+# avec le chapitre réglementaire (présomption faible, 15/17, ~24 % au lieu de
+# ~44 %). Le moins joli chiffre est le plus défendable.
+#
+# ⛔ VOIE A EXÉCUTÉE (06/09) — LA PRÉSOMPTION EST RÉFUTÉE, NE PAS ACTIVER.
+# Les 12 paires ayant un homologue ont été lues une à une : l'article de même
+# numéro applique la disposition en cause **1 fois sur 12** (seul `L4331-1` →
+# `R4331-1`, les actes d'ergothérapie). Onze fois sur douze le texte trouvé parle
+# d'autre chose — `R161-17` du volontariat civil quand `L161-17` renvoie ses
+# conditions d'application, `R262-31` du formulaire de demande quand `L262-31`
+# renvoie un délai, `D149-11` d'une instance consultative quand `L149-11` renvoie
+# des conditions de ressources. `R244-1` n'est même qu'un renvoi vers un autre
+# code, sans contenu propre.
+#
+# Ce n'est donc pas une présomption imprécise, c'est une présomption FAUSSE : le
+# contrôle, qui teste l'existence d'un numéro sans jamais lire le texte, désigne
+# un texte sans rapport. Détail et table des 12 verdicts dans
+# `reference/note_protocole_suppressions_a_tort.md` § 7.
+#
+# La variante par CITATION (un article réglementaire qui cite l'article de loi en
+# cause) a été mesurée elle aussi, et fermée : sur un index de 20 790 articles L
+# cités, 44 citants pour `L161-17` et 16 pour `L232-6` — la règle se déclencherait
+# presque toujours, même défaut qu'ici — et les citants sont des renvois croisés
+# (`L821-4` cité par `R232-5`, `R262-11`, `R861-10`), pas des textes d'application.
+#
+# DEUX rapprochements mécaniques testés, deux échecs, même raison : la numérotation
+# comme la citation sont des substituts FORMELS d'une relation SÉMANTIQUE — « ce
+# texte applique-t-il cette clause ? ». Seule la lecture l'établit, et c'est ce que
+# le dispositif ne peut pas faire à chaque génération.
+#
+# Le code reste ici parce qu'un contrôle inerte accompagné de la raison de son
+# inertie vaut mieux qu'un code supprimé dont on retentera l'idée dans six mois.
+# **En l'état, l'activer ferait taire le dispositif sur la foi d'un texte qui ne dit
+# rien du décret attendu.**
+CONTROLE_DECRET_PRIS = False
+
+# Au plus N articles interrogés par génération : borne le coût réseau. En
+# pratique 1 à 2 des 8 articles portent une clause (13,9 % mesurés).
+_MAX_LOOKUPS_DECRET = 4
+
+
+def decret_pris_pour_les_clauses(legal_sources: Optional[List[Dict]],
+                                 client=None) -> Optional[bool]:
+    """Les clauses « par décret » des articles remontés ont-elles toutes leur
+    article réglementaire dans le corpus ?
+
+    Rend **True** si chaque article porteur d'une clause a son homologue `R…`/`D…`
+    de même numéro, **False** si au moins un n'en a pas, **None** si la question
+    ne se pose pas (aucune clause, aucune source) ou si la lecture échoue.
+
+    Aucun embedding, aucun modèle : un `scroll` filtré sur `num`, qui est indexé
+    en `keyword` — c'est exactement ce que fait déjà `lookup_articles_par_num`
+    pour F2.
+
+    Nuance assumée : la clause est cherchée dans le `contenu` INTÉGRAL, alors que
+    le détecteur lit le contexte tronqué. L'écart ne joue que dans le sens
+    prudent — un article dont la clause a été coupée du prompt peut faire rendre
+    False (donc « on demande quand même »), jamais l'inverse.
+    """
+    if not legal_sources:
+        return None
+    client = client or qdrant_client
+    if client is None:
+        return None
+
+    porteurs = [art for art in legal_sources
+                if _DECRET_PREVU_RE.search(art.get("contenu")
+                                           or art.get("article_complet") or "")]
+    if not porteurs:
+        return None
+
+    for art in porteurs[:_MAX_LOOKUPS_DECRET]:
+        num = str(art.get("num") or "")
+        coll = art.get("collection")
+        racine = re.sub(r"^[A-Za-z]+", "", num)
+        if not racine or not coll:
+            return None  # on ne conclut pas sur une source mal formée
+        trouve = False
+        for prefixe in ("R", "D"):
+            try:
+                points, _ = client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(must=[FieldCondition(
+                        key="num", match=MatchValue(value=prefixe + racine))]),
+                    limit=1, with_payload=False, with_vectors=False,
+                )
+            except Exception:  # noqa: BLE001 - lecture d'appoint, jamais bloquante
+                return None
+            if points:
+                trouve = True
+                break
+        if not trouve:
+            return False
+    return True
+
 
 def detecter_point_decret(question: str, legal_context: str,
-                          search_results: Optional[List[Dict]] = None) -> Optional[Dict]:
+                          search_results: Optional[List[Dict]] = None,
+                          decret_pris: Optional[bool] = None) -> Optional[Dict]:
     """Faut-il interroger le rédacteur sur l'avancement d'un décret ?
 
     Rend un dictionnaire décrivant le point à soumettre, ou None. Aucun appel
@@ -2012,6 +2137,14 @@ def detecter_point_decret(question: str, legal_context: str,
     pose_par_la_question = bool(_QUESTION_DECRET_RE.search(question or ""))
     prevu_par_un_texte = bool(_DECRET_PREVU_RE.search(legal_context or ""))
     if not (pose_par_la_question or prevu_par_un_texte):
+        return None
+
+    # Contrôle « le décret annoncé est déjà pris » — INERTE par défaut
+    # (`CONTROLE_DECRET_PRIS = False`), donc `decret_pris` vaut None et rien ne
+    # change. Il ne touche QUE la branche `texte_prevu` : quand le parlementaire
+    # interroge lui-même sur un décret, on lui répond, quelle que soit la base —
+    # c'est l'arbitrage de l'utilisateur et ce contrôle ne le rouvre pas.
+    if (decret_pris is True and prevu_par_un_texte and not pose_par_la_question):
         return None
 
     # ARBITRAGE DE L'UTILISATEUR (06/09) : on demande DANS TOUS LES CAS.
@@ -3592,7 +3725,15 @@ def generate_response(
 
         # F15 : le point « décret » se calcule ici, une fois le contexte
         # juridique et internet connus, et sans aucun appel supplémentaire.
-        point_decret = detecter_point_decret(question, legal_context, search_results)
+        #
+        # La lecture Qdrant du contrôle « décret déjà pris » se fait ICI, pas
+        # dans le détecteur : le client et la liste d'articles y vivent déjà, et
+        # `detecter_point_decret` reste une fonction pure, testable à doublures
+        # et sans accès réseau. Inerte tant que `CONTROLE_DECRET_PRIS` est False.
+        decret_pris = (decret_pris_pour_les_clauses(legal_sources)
+                       if CONTROLE_DECRET_PRIS else None)
+        point_decret = detecter_point_decret(question, legal_context,
+                                             search_results, decret_pris)
 
         # F16 : la limite dépend de la longueur demandée, puisque la fenêtre du
         # modèle porte le prompt ET la réponse. On la calcule ici pour pouvoir
@@ -4542,7 +4683,16 @@ else:
                     collections = qdrant_client.get_collections()
                     doc_collections = [
                         col.name for col in collections.collections
-                        if col.name not in {"Code_de_la_sécurité_sociale", "Code_du_travail", "CASF", "QuestionParlementaire", "Code_de_la_santé_publique"}
+                        # Noms RÉELS des collections (espaces, pas underscores) :
+                        # la liste précédente écrivait « Code_du_travail » et ne
+                        # correspondait donc à AUCUNE collection existante. Elle ne
+                        # protégeait rien ; seul le test « "_" in col.name » ci-dessous
+                        # écartait les codes, par l'accident de leur nom. Sans effet
+                        # aujourd'hui, mais un garde-fou qui ne garde rien est pire
+                        # qu'un garde-fou absent : on le croit en place.
+                        if col.name not in {"Code de la sécurité sociale", "Code du travail",
+                                            "CASF", "QuestionParlementaire",
+                                            "Code de la santé publique"}
                         and "_" in col.name
                         and not _is_legal_infra_collection(col.name)
                     ]
