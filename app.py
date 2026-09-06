@@ -2419,23 +2419,57 @@ def _position_dans_le_code(contexte_hierarchique: str, niveaux: int = 3, max_len
     return " > ".join(p if len(p) <= max_len else p[:max_len - 1].rstrip() + "…" for p in parts)
 
 
-def formater_article_pour_prompt(art: dict, max_tokens: int) -> str:
+def _situation_article(art: dict) -> tuple:
+    """(code lisible, position dans le code) — l'identité de place d'un article."""
+    code_brut = art.get("collection") or art.get("code") or ""
+    code = _NOMS_CODES.get(code_brut, code_brut).strip()
+    code = code.lower() if code.lower().startswith("code") else code
+    return code, _position_dans_le_code(art.get("contexte_hierarchique", ""))
+
+
+def formater_article_pour_prompt(art: dict, max_tokens: int,
+                                 situation_precedente: Optional[tuple] = None) -> str:
     """Bloc d'un article dans TEXTES JURIDIQUES APPLICABLES :
 
         Article L4321-14 — code de la santé publique (Livre III : … > Chapitre Ier : Masseurs-kinésithérapeutes)
         <titre>
         <contenu tronqué>
+
+    `situation_precedente` : (code, position) de l'article qui PRÉCÈDE dans le
+    bloc. Quand elle est identique, la position n'est pas réimprimée — l'article
+    reste situé dans son code (F7), mais la chaîne hiérarchique n'est plus
+    répétée. L'enrichissement ramenant tout un chapitre, la même position était
+    réécrite jusqu'à 25 fois dans un seul prompt : 15,3 % du bloc juridique,
+    ≈ 673 tokens par question, pour zéro information ajoutée.
     """
-    code_brut = art.get("collection") or art.get("code") or ""
-    code = _NOMS_CODES.get(code_brut, code_brut).strip()
-    position = _position_dans_le_code(art.get("contexte_hierarchique", ""))
-    situation = code.lower() if code.lower().startswith("code") else code
+    code, position = _situation_article(art)
+    situation = code
     if position:
-        situation = f"{situation} ({position})" if situation else f"({position})"
+        meme = situation_precedente == (code, position)
+        suffixe = "même chapitre que ci-dessus" if meme else position
+        situation = f"{situation} ({suffixe})" if situation else f"({suffixe})"
     entete = f"Article {art.get('num', 'N/A')}" + (f" — {situation}" if situation else "")
     titre = (art.get("titre") or "").strip()
     contenu = truncate_text(art.get("contenu", "") or "", max_tokens=max_tokens)
     return "\n".join(p for p in (entete, titre, contenu) if p)
+
+
+def formater_articles_pour_prompt(articles: List[dict], budget_tokens: int) -> str:
+    """Le bloc juridique entier, sans répéter la position d'un même chapitre.
+
+    Le dégroupage se fait sur l'article PRÉCÉDENT, pas sur l'ensemble déjà vu :
+    l'ordre de `sort_articles_for_prompt` (cités, puis initiaux par score, puis
+    enrichis par numéro) rassemble les articles d'un même chapitre, et un renvoi
+    à « ci-dessus » ne doit jamais désigner un article éloigné.
+    """
+    if not articles:
+        return ""
+    par_article = max(1, budget_tokens // len(articles))
+    blocs, precedente = [], None
+    for art in articles:
+        blocs.append(formater_article_pour_prompt(art, par_article, precedente))
+        precedente = _situation_article(art)
+    return "\n\n".join(blocs)
 
 
 # Fonction qui tri les articles pour que la limite de tokens des prompts s'applique intelligemment
@@ -3755,13 +3789,12 @@ def generate_response(
 
             if legal_sources:
                 legal_sources_for_prompt = sort_articles_for_prompt(legal_sources)
-                # Tronquer chaque article juridique
-                # F7 : chaque article est situé dans son code (portée bornée)
-                _par_article = TOKEN_LIMITS[current_model_size]['legal_context'] // len(legal_sources_for_prompt)
-                legal_context = "\n\n".join(
-                    formater_article_pour_prompt(art, _par_article)
-                    for art in legal_sources_for_prompt
-                )
+                # Chaque article est situé dans son code (F7, portée bornée) et
+                # tronqué à sa part du budget ; la position hiérarchique n'est
+                # pas réimprimée quand elle est celle de l'article précédent.
+                legal_context = formater_articles_pour_prompt(
+                    legal_sources_for_prompt,
+                    TOKEN_LIMITS[current_model_size]['legal_context'])
             if partielles:
                 # Base juridique partielle : le modèle doit savoir que ce qu'il
                 # lit n'est pas tout ce qui existe.
