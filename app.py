@@ -57,12 +57,6 @@ if 'show_rename_modal' not in st.session_state:
 if 'current_doc_to_rename' not in st.session_state:
     st.session_state.current_doc_to_rename = None
 
-# Initialisation des états de certaines variables si non existants
-if 'use_priority_docs' not in st.session_state:
-    st.session_state.use_priority_docs = False
-if 'priority_docs' not in st.session_state:
-    st.session_state.priority_docs = []
-
 # Estimation du nombre de tokens d'un texte en français
 def estimate_tokens(text):
     """Estime le nombre de tokens pour Mistral Large (1 token ≈ 4 caractères en français)."""
@@ -1035,6 +1029,23 @@ def lookup_articles_par_num(nums: list, collections: list, debug: bool = False) 
     return found
 
 
+def _cle_article(art: dict) -> tuple:
+    """Clé d'identité d'un article : le numéro NE SUFFIT PAS.
+
+    Les numéros ne sont pas uniques entre codes (mesuré : 1 770 numéros portés
+    par plusieurs codes, dont 1 147 santé publique ↔ travail et 603 CASF ↔
+    sécurité sociale — soit exactement le champ des affaires sociales).
+    """
+    return (art.get("num"), art.get("collection") or art.get("code"))
+
+
+def _rang_chunk(art: dict) -> tuple:
+    """Départage DÉTERMINISTE entre deux chunks d'un même article : meilleur
+    score d'abord, puis plus petit `chunk_id`. Sans lui, le chunk retenu dépend
+    de l'ordre — non garanti à score égal — que rend le moteur."""
+    return (-(art.get("score") or 0), str(art.get("chunk_id") or ""))
+
+
 def _tokens_saillants(text: str) -> set:
     toks = re.findall(r"[a-zàâäéèêëïîôöùûüç]{4,}", (text or "").lower())
     return {t for t in toks if t not in _STOPWORDS_FR}
@@ -1057,13 +1068,32 @@ def search_articles(
 ) -> Dict[str, Any]:
     """Recherche optimisée d'articles juridiques dans Qdrant avec enrichissement (section + références)."""
 
+    # ⚠️ CONTRAT DE RETOUR — lire avant de toucher aux `return`.
+    #
+    # Une liste `sources` vide voulait dire DEUX choses que rien ne distinguait :
+    # « la loi ne dit rien sur ce point » et « la recherche juridique est
+    # tombée ». Dans le second cas la réponse était rédigée sans base légale et
+    # paraissait normale, la trace partant dans des journaux que personne ne lit.
+    # Toute sortie porte donc désormais `echec` : None quand le vide est un
+    # résultat, une chaîne de motif quand c'est une panne. L'appelant DOIT le
+    # lire — `generate_response` en fait un avertissement à l'écran, une entrée
+    # de journal, et une phrase différente dans le prompt.
+    vide = {"sources": [], "total": 0, "limit": limit, "offset": 0,
+            "echec": None, "collections_en_echec": [], "mode": None}
+
     target_collections = ["CASF", "Code du travail", "Code de la santé publique", "Code de la sécurité sociale"]
-    collections = qdrant_client.get_collections()
+    try:
+        collections = qdrant_client.get_collections()
+    except Exception as exc:  # noqa: BLE001
+        return {**vide, "echec": f"Qdrant injoignable ({type(exc).__name__}: {exc})"}
     valid_collections = [c.name for c in collections.collections if c.name in target_collections]
 
     if not valid_collections:
-        return {"sources": [], "total": 0, "limit": limit, "offset": 0}
+        # Aucune des quatre collections de codes n'est présente : ce n'est pas
+        # un corpus sans réponse, c'est un corpus absent.
+        return {**vide, "echec": "aucune collection de code juridique n'est accessible"}
 
+    collections_en_echec = []
     try:
         query_filter = models.Filter(
             must=[models.FieldCondition(key="partie", match=models.MatchValue(value=partie))]
@@ -1081,6 +1111,8 @@ def search_articles(
         # dense : vecteur des sous-questions fusionnées ; BM25 + filtre hiérarchie :
         # sujet ré-isolé depuis la question brute (l'heuristique attend le texte de la QE).
         unified_results = None if partie else unified_code_search(query, embedding, limit)
+
+        mode = "unifie" if unified_results is not None else "repli"
 
         if unified_results is not None:
             if debug:
@@ -1101,7 +1133,11 @@ def search_articles(
                         with_vectors=False
                     ).points
                     all_results.extend(hits)
-                except Exception:
+                except Exception as exc:  # noqa: BLE001
+                    # Une collection en échec = base juridique PARTIELLE. Le
+                    # `continue` nu rendait ce trou invisible : on le consigne
+                    # pour que l'appelant puisse le dire.
+                    collections_en_echec.append(f"{collection} ({type(exc).__name__})")
                     continue
 
             # --- 2. Filtrage par score (cosinus) ---
@@ -1115,18 +1151,40 @@ def search_articles(
             ]
 
         if not results:
-            return {"sources": [], "total": 0, "limit": limit, "offset": 0}
+            # Vide LÉGITIME (`echec` reste None) — sauf si toutes les collections
+            # interrogées sont tombées, auquel cas le vide est une panne.
+            toutes_tombees = (mode == "repli"
+                              and len(collections_en_echec) == len(valid_collections))
+            return {**vide, "mode": mode,
+                    "collections_en_echec": collections_en_echec,
+                    "echec": ("toutes les collections de codes ont échoué : "
+                              + ", ".join(collections_en_echec)) if toutes_tombees else None}
 
         # --- 4. Normalisation en articles initiaux ---
         initial_articles = normalize_chunks(results, provenance="initial")
 
         # --- 5. Déduplication + tri des initiaux ---
-        seen = set()
-        unique_initials = []
+        # La clé porte la COLLECTION : 1 770 numéros (5,3 %) sont portés par
+        # plusieurs codes — `L114-5` existe au CASF et à la sécurité sociale,
+        # `D1142-2` à la santé publique et au travail. Avec `num` seul, le
+        # second était écarté en silence, non comme un doublon mais comme un
+        # article différent portant le même numéro (mesuré : ~1 question sur 20).
+        #
+        # Le départage est explicite : à score égal, le moteur n'ordonne PAS les
+        # chunks d'un même article de façon stable, si bien que le chunk retenu
+        # changeait d'un appel à l'autre — et avec lui son `base_legislative`,
+        # donc tout l'enrichissement par renvois. Mesuré : le contexte juridique
+        # de 6 questions sur 15 n'était pas reproductible.
+        seen = {}
+        ordre = []
         for art in initial_articles:
-            if art["num"] not in seen:
-                seen.add(art["num"])
-                unique_initials.append(art)
+            k = _cle_article(art)
+            if k not in seen:
+                seen[k] = art
+                ordre.append(k)
+            elif _rang_chunk(art) < _rang_chunk(seen[k]):
+                seen[k] = art
+        unique_initials = [seen[k] for k in ordre]
 
         # --- 5 bis. F2 : articles cités dans la question + bonus lexical ---
         articles_cites = extraire_articles_cites(query)
@@ -1153,8 +1211,8 @@ def search_articles(
         seen = set()
         final_articles = []
         for art in all_articles:
-            if art["num"] not in seen:
-                seen.add(art["num"])
+            if _cle_article(art) not in seen:
+                seen.add(_cle_article(art))
                 final_articles.append(art)
 
         # --- 8 bis. F2 : forcer la présence des articles explicitement cités ---
@@ -1176,13 +1234,19 @@ def search_articles(
             "sources": final_articles,
             "total": len(final_articles),
             "limit": limit,
-            "offset": 0
+            "offset": 0,
+            "echec": None,
+            "collections_en_echec": collections_en_echec,
+            "mode": mode,
         }
 
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         import traceback
         traceback.print_exc()
-        return {"sources": [], "total": 0, "limit": limit, "offset": 0}
+        # La trace part sur la console du serveur — sur Streamlit Cloud, dans des
+        # journaux que personne ne lit. Le motif remonte donc AUSSI par le retour.
+        return {**vide, "collections_en_echec": collections_en_echec,
+                "echec": f"{type(exc).__name__}: {exc}"}
 
 # Fonction qui enrichit la liste des articles initiaux avec les articles de même niveau
 def enrich_same_context(initial_articles: list, collections: list, debug=True) -> list:
@@ -2596,6 +2660,16 @@ def generate_legal_analysis(
             )
         articles = st.session_state.last_articles_search
 
+        # Même règle que sur le chemin de génération : un échec de la recherche
+        # ne doit pas se lire comme une absence d'article.
+        if articles.get("echec"):
+            st.error("⚠️ **La recherche juridique a échoué** — l'absence d'article "
+                     "ci-dessous ne signifie pas qu'aucun texte ne s'applique. "
+                     f"(Motif : {articles['echec']})")
+        elif articles.get("collections_en_echec"):
+            st.warning("⚠️ Base juridique partielle : "
+                       f"{', '.join(articles['collections_en_echec'])}.")
+
         # --- Étape 2 : Construction de l'arbre législatif ---
         enrichis = build_legislative_tree(articles["sources"])
         stats = enrichis.pop('stats', {}) if isinstance(enrichis, dict) else {}
@@ -2831,10 +2905,16 @@ def afficher_journal_generation(response_data: dict) -> None:
     reduction = meta.get("reduction_contexte")
     diagnostic = meta.get("diagnostic")
     point = meta.get("point_decret")
+    # Même raison que la réduction de contexte : c'est un fait qui change ce que
+    # vaut la réponse, il se signale MÊME sans journal.
+    echec_jur = meta.get("echec_juridique")
     morceaux = [f"{etiquette}={gen[cle]}" for cle, etiquette in _CHAMPS_JOURNAL
                 if gen.get(cle) is not None]
-    if not morceaux and not reduction and not diagnostic and not point:
+    if not morceaux and not reduction and not diagnostic and not point and not echec_jur:
         return
+    if echec_jur:
+        morceaux.append("recherche_juridique="
+                        + ("echec" if echec_jur.get("motif") else "partielle"))
     if reduction:
         retire = ", ".join(f"{k}:{v}" for k, v in (reduction.get("retire") or {}).items())
         morceaux.append(f"contexte_reduit={reduction.get('avant')}->{reduction.get('apres')}")
@@ -2861,6 +2941,19 @@ def afficher_journal_generation(response_data: dict) -> None:
     if not morceaux:
         return
     st.caption("[generation] " + " · ".join(morceaux))
+    if echec_jur:
+        # Placé AVANT le point décret et la réduction : c'est l'avertissement le
+        # plus lourd — la réponse ci-dessus peut parler du droit sans l'avoir lu.
+        if echec_jur.get("motif"):
+            st.error("⚠️ **La recherche juridique a échoué.** La réponse ci-dessus a été "
+                     "rédigée SANS base légale : l'absence d'article cité ne signifie pas "
+                     "qu'aucun texte ne s'applique. À vérifier avant tout usage. "
+                     f"(Motif : {echec_jur['motif']})")
+        else:
+            _p = echec_jur.get("partielles") or []
+            st.warning("⚠️ **Base juridique partielle** : "
+                       f"{len(_p)} collection(s) de codes n'ont pas pu être interrogées "
+                       f"({', '.join(_p)}). Des articles applicables peuvent manquer.")
     if point:
         # Une question AU rédacteur : elle doit se voir, pas se relever au grep.
         # Placée sous la réponse et non au-dessus — elle porte sur un point à
@@ -3547,6 +3640,9 @@ def generate_response(
         # existait, et le diagnostic partait sur une fausse piste (#10270).
         similar_documents, legal_sources, search_results, uploaded_results = [], [], [], []
         parliamentary_context = legal_context = uploaded_docs_context = search_context = ""
+        # Initialisés ICI pour que le chemin d'erreur ait quelque chose à
+        # rapporter, comme les quatre contextes ci-dessus (F18).
+        echec_juridique, partielles = None, []
 
         status_placeholder = st.empty()
 
@@ -3606,34 +3702,27 @@ def generate_response(
         # Étape 1 : Recherche d'anciennes questions
         parliamentary_context = "Aucun contexte parlementaire trouvé."
         similar_documents = []
-        if not (hasattr(st.session_state, 'use_priority_docs') and
-                st.session_state.use_priority_docs and
-                hasattr(st.session_state, 'selected_docs') and
-                st.session_state.selected_docs):
-            status_placeholder.markdown(
-                '<div class="status-message">🏛️ Recherche dans la base des anciennes questions / réponses...</div>',
-                unsafe_allow_html=True
+        status_placeholder.markdown(
+            '<div class="status-message">🏛️ Recherche dans la base des anciennes questions / réponses...</div>',
+            unsafe_allow_html=True
+        )
+        _pool = search_question_parlementaire(question, top_k=8)
+        similar_documents = _pool[:5]  # affichage : les 5 plus proches
+        if _pool:
+            # Contexte du prompt : 3 QE après repondération par la récence
+            # (une réponse ancienne ne doit pas dicter la réponse actuelle).
+            selected_docs = rerank_parliamentary_by_recency(_pool)[:3]
+            _now = datetime.now()
+            parliamentary_context = "\n\n".join(
+                [f"Contexte parlementaire {i+1} {annoter_qe_contexte(doc, _now)}:\n"
+                 f"Question: {doc.question}\nRéponse: {truncate_text(doc.reponse, max_tokens=TOKEN_LIMITS[current_model_size]['parliamentary_context'] // 3)}"
+                 for i, doc in enumerate(selected_docs)]
             )
-            _pool = search_question_parlementaire(question, top_k=8)
-            similar_documents = _pool[:5]  # affichage : les 5 plus proches
-            if _pool:
-                # Contexte du prompt : 3 QE après repondération par la récence
-                # (une réponse ancienne ne doit pas dicter la réponse actuelle).
-                selected_docs = rerank_parliamentary_by_recency(_pool)[:3]
-                _now = datetime.now()
-                parliamentary_context = "\n\n".join(
-                    [f"Contexte parlementaire {i+1} {annoter_qe_contexte(doc, _now)}:\n"
-                     f"Question: {doc.question}\nRéponse: {truncate_text(doc.reponse, max_tokens=TOKEN_LIMITS[current_model_size]['parliamentary_context'] // 3)}"
-                     for i, doc in enumerate(selected_docs)]
-                )
 
         # Étape 2 : Recherche des articles juridiques
         legal_context = "Aucun texte juridique spécifique n'a été identifié."
         legal_sources = []
-        if (not (hasattr(st.session_state, 'use_priority_docs') and
-                st.session_state.use_priority_docs and
-                hasattr(st.session_state, 'selected_docs') and
-                st.session_state.selected_docs)) and current_include_legal:
+        if current_include_legal:
             status_placeholder.markdown(
                 '<div class="status-message">📚 Recherche dans les codes juridiques...</div>',
                 unsafe_allow_html=True
@@ -3648,6 +3737,22 @@ def generate_response(
             )
             legal_sources = legal_sources_result["sources"]
 
+            # Un échec de la recherche n'est PAS une absence d'article. Trois
+            # canaux, et le premier est le décisif : la phrase envoyée au
+            # modèle. L'avertissement à l'écran peut être sauté par qui lit la
+            # réponse, le journal n'est lu qu'après coup ; seul le prompt agit
+            # sur le texte produit. Écrire « aucun texte juridique n'a été
+            # identifié » quand la recherche est tombée, c'est faire affirmer à
+            # l'outil une chose qu'il ne sait pas — et c'est cette phrase-là qui
+            # autorise la réponse à être rédigée comme si la loi était muette.
+            echec_juridique = legal_sources_result.get("echec")
+            partielles = legal_sources_result.get("collections_en_echec") or []
+            if echec_juridique:
+                legal_context = ("⚠️ La recherche juridique a ÉCHOUÉ : aucune base légale "
+                                 "n'a pu être consultée pour cette question. Ne pas en "
+                                 "conclure qu'aucun texte ne s'applique, et ne rien "
+                                 "affirmer sur l'état du droit.")
+
             if legal_sources:
                 legal_sources_for_prompt = sort_articles_for_prompt(legal_sources)
                 # Tronquer chaque article juridique
@@ -3657,6 +3762,13 @@ def generate_response(
                     formater_article_pour_prompt(art, _par_article)
                     for art in legal_sources_for_prompt
                 )
+            if partielles:
+                # Base juridique partielle : le modèle doit savoir que ce qu'il
+                # lit n'est pas tout ce qui existe.
+                legal_context += ("\n\n⚠️ Base juridique PARTIELLE : "
+                                  f"{len(partielles)} collection(s) de codes n'ont pas pu "
+                                  "être interrogées. Des articles applicables peuvent "
+                                  "manquer.")
 
         # Étape 3 : Recherche dans les documents uploadés
         status_placeholder.markdown(
@@ -3688,11 +3800,7 @@ def generate_response(
         search_results = []
 
         search_engine = st.session_state.get("search_engine")
-        if (search_engine and
-            not (hasattr(st.session_state, 'use_priority_docs') and
-                 st.session_state.use_priority_docs and
-                 hasattr(st.session_state, 'selected_docs') and
-                 st.session_state.selected_docs)):
+        if search_engine:
             status_placeholder.markdown(
                 f'<div class="status-message">🌐 Recherche internet ({search_engine})...</div>',
                 unsafe_allow_html=True
@@ -3803,6 +3911,12 @@ def generate_response(
             # None dans le cas normal — sa présence signale une réponse produite
             # sur contexte réduit, donc moins précise qu'elle n'aurait pu l'être.
             "reduction_contexte": _reduction,
+            # Un échec de la recherche juridique — distinct d'une absence
+            # d'article. None dans le cas normal ; sa présence dit que la
+            # réponse ci-dessus a été rédigée SANS base légale consultable.
+            "echec_juridique": ({"motif": echec_juridique} if echec_juridique
+                                else {"partielles": partielles} if partielles
+                                else None),
         }
 
         return {
@@ -4670,40 +4784,6 @@ else:
                         if _consigne:
                             consignes_sous_questions[sq] = _consigne
 
-                st.markdown("---")
-
-                # --- Limiter les sources ---
-                use_priority_docs = st.checkbox(
-                    "Limiter la recherche à certains documents",
-                    value=False,
-                    key="use_priority_docs",
-                    help="La réponse n'intègre alors ni les anciennes QE, ni les textes juridiques, ni la recherche internet.",
-                )
-                if use_priority_docs:
-                    collections = qdrant_client.get_collections()
-                    doc_collections = [
-                        col.name for col in collections.collections
-                        # Noms RÉELS des collections (espaces, pas underscores) :
-                        # la liste précédente écrivait « Code_du_travail » et ne
-                        # correspondait donc à AUCUNE collection existante. Elle ne
-                        # protégeait rien ; seul le test « "_" in col.name » ci-dessous
-                        # écartait les codes, par l'accident de leur nom. Sans effet
-                        # aujourd'hui, mais un garde-fou qui ne garde rien est pire
-                        # qu'un garde-fou absent : on le croit en place.
-                        if col.name not in {"Code de la sécurité sociale", "Code du travail",
-                                            "CASF", "QuestionParlementaire",
-                                            "Code de la santé publique"}
-                        and "_" in col.name
-                        and not _is_legal_infra_collection(col.name)
-                    ]
-                    doc_names = [col.split('__')[0].replace('_', ' ') for col in doc_collections]
-                    selected_docs = st.multiselect(
-                        "Documents à utiliser",
-                        options=doc_names,
-                        key="priority_docs",
-                        placeholder="Choisir...",
-                    )
-
             # Bouton de génération : sous le formulaire, dans le flux de lecture.
             generate_parliamentary_button = st.button(
                 "Générer la réponse",
@@ -4881,7 +4961,17 @@ else:
                                     st.markdown("###### 📚 Articles juridiques pertinents")
                                     legal_sources = response_data.get("legal_sources", [])
                                     if not legal_sources:
-                                        st.info("Aucun article juridique trouvé.")
+                                        # « Aucun article trouvé » est une AFFIRMATION.
+                                        # Elle est fausse quand la recherche est tombée :
+                                        # on ne sait alors pas s'il y en avait.
+                                        _ej = ((response_data.get("metadata") or {})
+                                               .get("echec_juridique") or {})
+                                        if _ej.get("motif"):
+                                            st.error("⚠️ La recherche juridique a échoué — "
+                                                     "on ignore si des articles s'appliquent. "
+                                                     f"({_ej['motif']})")
+                                        else:
+                                            st.info("Aucun article juridique trouvé.")
                                     else:
                                         # 1. Regroupement par code juridique
                                         by_code = {}
