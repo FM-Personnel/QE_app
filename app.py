@@ -1869,6 +1869,50 @@ def search_uploaded_documents(
         return []
 
 # Fonction qui ajuste la taille du contexte issu des "autres collections" à la pertinence (score) du retrieval
+_PIED_MIN_CARACTERES = 200
+_FIN_DE_PHRASE = re.compile(r"[.!?:;)\]»…]\s*$")
+
+
+def isoler_pied_du_corps(passage: str) -> str:
+    """Sépare visuellement le pied de garde-fous du contenu qui l'entoure.
+
+    ⚠️ CE N'EST PAS UNE MISE EN FORME. À l'ingestion, `chunk_by_section` découpe
+    une section trop longue **au nombre de mots** (`range(0, len(words),
+    max_words)`), donc en pleine phrase, et `_mk_chunk` colle le pied à CHAQUE
+    morceau. Le pied s'accroche alors à une phrase inachevée et se lit comme sa
+    suite. Mesuré sur les 659 chunks de fiche réellement stockés : **106 (16 %)**
+    ont un corps coupé en pleine phrase avant leur pied, et **30** portent du
+    contenu APRÈS le pied (`_extend_last` fusionne une section courte une fois
+    le pied déjà posé).
+
+    Cas réel (#11943) : « … la sanction n'est pas fondée » suivi sans rupture de
+    trois cents caractères de garde-fous sans rapport. La conclusion a été
+    omise, et nous l'avions imputée au modèle.
+
+    On insère donc un saut de ligne aux deux jonctions. Le pied n'est pas
+    déplacé, rien n'est retiré, rien n'est ajouté : la seule chose qui change
+    est qu'une phrase du contenu ne se prolonge plus en garde-fou.
+
+    **Ce que cela ne répare pas** : la suite de la phrase coupée vit dans le
+    chunk SUIVANT et n'est pas ramenée ici. Seule une réingestion avec un
+    découpage aux frontières de phrase corrigerait la cause ; elle n'est pas
+    décidée, et ce correctif ne la remplace pas.
+    """
+    t = passage or ""
+    i = t.rfind("[")
+    if i < 0:
+        return t
+    j = t.find("]", i)
+    if j < 0 or (j - i) < _PIED_MIN_CARACTERES:
+        return t
+    corps, pied, apres = t[:i].rstrip(), t[i:j + 1], t[j + 1:].lstrip()
+    if corps and not _FIN_DE_PHRASE.search(corps):
+        corps += "\n"          # la phrase inachevée ne se prolonge plus en pied
+    elif corps:
+        corps += " "
+    return corps + pied + (("\n" + apres) if apres else "")
+
+
 def format_uploaded_docs_by_relevance(
     uploaded_results: List[Dict],
     min_score: float = SEUIL_DOC_STANDARD,
@@ -1907,9 +1951,12 @@ def format_uploaded_docs_by_relevance(
         # extrait plus long pour que la donnée utile ne soit pas coupée.
         limit = 1400 if doc.get("is_fiche") else max_length
 
+        # La jonction corps / pied est rendue lisible AVANT la troncature, pour
+        # qu'une phrase inachevée ne se prolonge pas en garde-fou (cf.
+        # `isoler_pied_du_corps`). Le pied n'est pas déplacé.
         formatted.append(
             f"Source: {source} (Section: {title})\n"
-            f"Passage: {passage[:limit]}...\n"
+            f"Passage: {isoler_pied_du_corps(passage)[:limit]}...\n"
             f"(Score: {score:.2f})\n"
         )
 
