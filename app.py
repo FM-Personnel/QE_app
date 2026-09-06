@@ -3681,22 +3681,43 @@ def generate_response(
         status_placeholder = st.empty()
 
         # Limites de tokens pour Mistral Large
+        #
+        # ⚠️ CE NE SONT PAS DES PLAFONDS DE BLOC. Chaque valeur borne le seul
+        # CORPS tronqué — `reponse` côté parlementaire, `contenu` côté juridique.
+        # L'en-tête, le titre, le texte de la question et les annotations sont
+        # ajoutés par-dessus et n'entrent dans aucun budget. Mesuré : le bloc
+        # juridique dépasse son plafond sur 37 questions sur 40 en `medium`
+        # (+1 188 tokens en médiane), le parlementaire sur 30 sur 40.
+        #
+        # `parliamentary_context` : 4 500 -> 1 500, décidé par l'utilisateur le
+        # 06/09 sur un test à l'aveugle de `feat/eval` — 7 paires anonymisées,
+        # contexte complet contre contexte réduit : 3 préférences pour l'un,
+        # 3 pour l'autre, 1 égalité, toutes qualifiées de « légères ».
+        # `medium`/`small` passent AUSSI à 1 500, et non à une valeur réduite
+        # proportionnellement : le plafond est divisé par 3 réponses, si bien
+        # que 1 500 rend exactement les 500 tokens par réponse qui ont été
+        # ÉPROUVÉS. Une réduction proportionnelle (1 000) descendrait à 333 par
+        # réponse, en deçà de ce que le test a validé.
+        #
+        # ⚠️ Décision de l'utilisateur : ce test sera REFAIT dans quelques
+        # semaines, quand l'outil aura évolué. La valeur vaut pour l'état
+        # actuel, pas pour toujours.
         TOKEN_LIMITS = {
             "large": {
                 "question": 1500,
-                "parliamentary_context": 4500,  # 3 réponses QE max
+                "parliamentary_context": 1500,  # 3 réponses QE, 500 tokens each
                 "search_context": 3000,         # 15 snippets Google
                 "legal_context": 5000,          # À affiner plus tard
             },
             "medium": {
                 "question": 1000,
-                "parliamentary_context": 3000,  # 2 réponses QE max
+                "parliamentary_context": 1500,  # idem : 500 tokens par réponse
                 "search_context": 1500,         # 10 snippets Google
                 "legal_context": 2000,          # À affiner plus tard
             },
             "small": {
                 "question": 1000,               # Même valeur que medium
-                "parliamentary_context": 3000,  # 2 réponses QE max (même que medium)
+                "parliamentary_context": 1500,  # Même que medium
                 "search_context": 1500,         # 10 snippets Google (même que medium)
                 "legal_context": 2000,          # Même que medium
             }
