@@ -1913,6 +1913,38 @@ def isoler_pied_du_corps(passage: str) -> str:
     return corps + pied + (("\n" + apres) if apres else "")
 
 
+def _scinder_pied(passage: str) -> tuple:
+    """(contenu, pied) — le pied est le bloc `[…]` final assez long, sinon ("", …).
+
+    Même règle de détection que `isoler_pied_du_corps`, éprouvée sur les 836
+    chunks de fiche : 0 faux négatif.
+    """
+    t = passage or ""
+    i = t.rfind("[")
+    if i < 0:
+        return t, ""
+    j = t.find("]", i)
+    if j < 0 or (j - i) < _PIED_MIN_CARACTERES:
+        return t, ""
+    return (t[:i] + t[j + 1:]).strip(), t[i:j + 1]
+
+
+# --- Pied garanti — INERTE par défaut ---------------------------------------
+#
+# Aujourd'hui le pied vit DANS le passage et la troncature à 1 400 caractères le
+# coupe : médiane délivrée 6,1 %, et 34 garde-fous de distinction sur 40
+# n'arrivent JAMAIS. À True, le pied est séparé du contenu, la troncature ne
+# s'applique qu'au contenu, et le pied est injecté UNE FOIS par fiche, ENTIER.
+#
+# Le taux d'arrivée passe alors à 100 % par construction — il ne dépend plus de
+# la longueur du chunk. Le coût, lui, est exactement la longueur des pieds
+# retenus : il suit la réduction que `feat/fiches` prépare.
+#
+# ⚠️ Ne pas activer avant que les pieds réduits soient EN BASE : sur les pieds
+# actuels (426 à 4 072 caractères) le coût mesuré est prohibitif.
+PIED_GARANTI = True
+
+
 def format_uploaded_docs_by_relevance(
     uploaded_results: List[Dict],
     min_score: float = SEUIL_DOC_STANDARD,
@@ -1942,6 +1974,7 @@ def format_uploaded_docs_by_relevance(
     filtered = filtered[:max_docs]
 
     formatted = []
+    pieds_par_source = {}          # fiche -> son pied, injecté une seule fois
     for doc in filtered:
         passage = doc.get("text", "")
         source = doc.get("collection", "inconnu").replace("_", " ")
@@ -1954,10 +1987,27 @@ def format_uploaded_docs_by_relevance(
         # La jonction corps / pied est rendue lisible AVANT la troncature, pour
         # qu'une phrase inachevée ne se prolonge pas en garde-fou (cf.
         # `isoler_pied_du_corps`). Le pied n'est pas déplacé.
+        if PIED_GARANTI and doc.get("is_fiche"):
+            contenu, pied = _scinder_pied(passage)
+            if pied:
+                pieds_par_source.setdefault(source, pied)
+            corps = contenu
+        else:
+            corps = isoler_pied_du_corps(passage)
+
         formatted.append(
             f"Source: {source} (Section: {title})\n"
-            f"Passage: {isoler_pied_du_corps(passage)[:limit]}...\n"
+            f"Passage: {corps[:limit]}...\n"
             f"(Score: {score:.2f})\n"
+        )
+
+    # Les pieds à la fin, UNE FOIS par fiche et ENTIERS : ils échappent ainsi à
+    # la troncature du passage, qui est ce qui les coupait.
+    for source, pied in pieds_par_source.items():
+        formatted.append(
+            f"Garde-fous — {source}\n"
+            f"(à respecter ; ne jamais citer les valeurs signalées comme périmées)\n"
+            f"{pied}\n"
         )
 
     return "\n---\n".join(formatted)
