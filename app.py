@@ -835,7 +835,7 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 # elles sont le retour arrière immédiat — et tout ce qui EXCLUAIT les collections
 # de codes des listes de documents doit continuer de le faire pour les deux
 # régimes à la fois.
-_SUFFIXE_CODES = ""
+_SUFFIXE_CODES = "__refonte_20260909"
 
 _BASES_PAR_CODE = ("CASF", "Code du travail", "Code de la santé publique",
                    "Code de la sécurité sociale")
