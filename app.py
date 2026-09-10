@@ -827,8 +827,35 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 # Repli automatique sur la recherche 4-collections si BM25 ou la collection
 # unifiée sont indisponibles.
 # =====================================================================
-_UNIFIED_CODE_COLLECTION = "CodesJuridiques"
+# --- LE RÉGLAGE DE BASCULE, ET LE SEUL --------------------------------------
+# "" sert le corpus historique ; "__refonte_20260909" servirait la refonte issue
+# de l'API Légifrance. IL VAUT "" ICI : ce déploiement ne bascule RIEN.
+#
+# La bascule n'est PAS un renommage. Les anciennes collections restent en base —
+# elles sont le retour arrière immédiat — et tout ce qui EXCLUAIT les collections
+# de codes des listes de documents doit continuer de le faire pour les deux
+# régimes à la fois.
+_SUFFIXE_CODES = ""
+
+_BASES_PAR_CODE = ("CASF", "Code du travail", "Code de la santé publique",
+                   "Code de la sécurité sociale")
+_BASE_UNIFIEE = "CodesJuridiques"
+_BASES_CODES = _BASES_PAR_CODE + (_BASE_UNIFIEE,)
+
+_CODE_COLLECTIONS = tuple(c + _SUFFIXE_CODES for c in _BASES_PAR_CODE)
+_UNIFIED_CODE_COLLECTION = _BASE_UNIFIEE + _SUFFIXE_CODES
 _UNIFIED_HIER_FIELDS = ("section", "chapitre", "titre_structure", "sous_section")
+
+
+def _est_collection_de_code(name: str) -> bool:
+    """Une collection de code juridique, QUEL QUE SOIT son suffixe de refonte.
+
+    Sert à les exclure des listes de documents. Le suffixe est délibérément
+    ignoré : des collections de refonte ont été créées le 10/09/2026 et, faute
+    d'être reconnues ici, elles sont entrées dans `search_uploaded_documents`
+    comme s'il s'agissait de fichiers versés par l'utilisateur.
+    """
+    return any(name == b or name.startswith(b + "__") for b in _BASES_CODES)
 
 
 def _is_legal_infra_collection(name: str) -> bool:
@@ -839,7 +866,8 @@ def _is_legal_infra_collection(name: str) -> bool:
     vector name ». À exclure de `search_uploaded_documents` et des sélecteurs de
     documents de l'UI.
     """
-    return name == _UNIFIED_CODE_COLLECTION or name.endswith("__bm25")
+    return (name == _BASE_UNIFIEE or name.startswith(_BASE_UNIFIEE + "__")
+            or name.endswith("__bm25"))
 
 _QE_STOP = set("""
 le la les un une des du de d au aux et ou a l en dans sur pour par que qui quoi dont ou
@@ -1081,7 +1109,7 @@ def search_articles(
     vide = {"sources": [], "total": 0, "limit": limit, "offset": 0,
             "echec": None, "collections_en_echec": [], "mode": None}
 
-    target_collections = ["CASF", "Code du travail", "Code de la santé publique", "Code de la sécurité sociale"]
+    target_collections = list(_CODE_COLLECTIONS)
     try:
         collections = qdrant_client.get_collections()
     except Exception as exc:  # noqa: BLE001
@@ -1798,16 +1826,13 @@ def search_uploaded_documents(
     all_results = []
     try:
         # 1. Récupère les collections à rechercher
-        protected = {
-            "QuestionParlementaire",
-            "Code de la sécurité sociale",
-            "Code du travail",
-            "CASF",
-            "Code de la santé publique",
-        }
+        # `_est_collection_de_code` couvre les deux régimes à la fois : le
+        # corpus servi ET les collections de refonte, qui coexistent en base.
+        protected = {"QuestionParlementaire"}
         collections = qdrant_client.get_collections()
         doc_collections = [col.name for col in collections.collections
                            if col.name not in protected
+                           and not _est_collection_de_code(col.name)
                            and not _is_legal_infra_collection(col.name)]
 
         # 2. Limite aux collections sélectionnées si spécifiées
@@ -4403,18 +4428,18 @@ else:
             collections = qdrant_client.get_collections()
             collection_names = [col.name for col in collections.collections]
 
-            protected_collections = {
-                "Code de la sécurité sociale",
-                "Code du travail",
-                "CASF",
-                "QuestionParlementaire",
-                "Code de la santé publique"
-            }
+            protected_collections = {"QuestionParlementaire"}
 
             # Filtre pour ne garder que les collections "documents" (ex: "NomDuDocument_2023")
             doc_collections = [
                 name for name in collection_names
-                if name not in protected_collections and "_" in name  # Ex: "MonDocument_2023"
+                # `"_" in name` suffisait tant que les collections de codes
+                # n'avaient que des espaces. Celles de refonte portent
+                # « __refonte_<date> » : sans l'exclusion explicite, elles
+                # apparaissent ici comme des documents versés.
+                if name not in protected_collections
+                and not _est_collection_de_code(name)
+                and "_" in name  # Ex: "MonDocument_2023"
                 and not _is_legal_infra_collection(name)
             ]
 
