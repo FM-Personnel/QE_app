@@ -8,11 +8,37 @@ strip regex (dépendances optionnelles, importées à la demande).
 """
 from __future__ import annotations
 
+import html as _html
 import io
 import re
 from pathlib import Path
 from typing import Union
 from urllib.parse import urlparse
+
+# --------------------------------------------------------------------------- #
+# ⚠️ NE PAS REMPLACER PAR `<[^>]+>` — c'est le motif qui a mange des seuils.
+#
+# Legifrance ecrit des « < » NON ECHAPPES dans ses tableaux : « < 700 € »,
+# « R < 6,5 % ». Un motif `<[^>]+>` avale alors depuis ce « < » jusqu'au « > »
+# de la balise SUIVANTE, et emporte le seuil avec lui. Mesure du 09/09 : dans
+# le corpus servi, `CSS L245-2` lit « chiffre d'affaires R 6,5 % » la ou la
+# source dit « R < 6,5 % » -- un seuil devenu une valeur. Grammatical,
+# plausible, faux.
+#
+# On n'avale donc QUE ce qui commence comme une vraie balise : une lettre, un
+# « / » fermant, ou un « ! » (commentaire, doctype). Un « < » suivi d'un espace,
+# d'un chiffre ou d'un « = » reste du texte.
+#
+# ⚠️ Et une trace ne se cherche pas dans le resultat : un caractere mange ne
+# laisse rien. Zero « < » dans le corpus ne prouve pas qu'aucun n'a ete perdu --
+# il faut comparer a la SOURCE.
+_BALISE = re.compile(r"(?s)</?[A-Za-z!][^>]*>")
+
+
+def _unescape(texte: str) -> str:
+    """Decode les entites HTML. L'ancien chemin de secours ne le faisait pas :
+    « &lt; », « &amp; », « &nbsp; » restaient litteraux dans le texte ingere."""
+    return _html.unescape(texte or "")
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -153,7 +179,8 @@ def extract_html(data: Union[bytes, str], url: str = "") -> str:
 
     # dernier recours : strip brut des balises
     text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
-    text = re.sub(r"(?s)<[^>]+>", "\n", text)
+    text = _BALISE.sub("\n", text)
+    text = _unescape(text)          # sinon « &lt; », « &amp; », « &nbsp; » restent
     return re.sub(r"\n{2,}", "\n", text)
 
 
