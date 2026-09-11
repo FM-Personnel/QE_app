@@ -1,11 +1,13 @@
 import streamlit as st
 import hashlib
+import html as _html   # entites HTML des reponses orales (&nbsp;, &#039;)
 import requests
 import os
 import pytz
 import time
 import unicodedata
 import importlib.metadata
+import random
 import re
 import tempfile
 import uuid
@@ -828,12 +830,26 @@ def build_export_content(response_data: dict, mode: str, include_legal_articles:
 # unifiée sont indisponibles.
 # =====================================================================
 # --- LE RÉGLAGE DE BASCULE, ET LE SEUL --------------------------------------
-# "" sert le corpus historique ; "__refonte_20260909" servirait la refonte issue
-# de l'API Légifrance. IL VAUT "" ICI : ce déploiement ne bascule RIEN.
+# "" sert le corpus historique ; "__refonte_20260909" sert la refonte issue de
+# l'API Légifrance.
+#
+# ⚠️ CE BLOC A ÉTÉ RAPATRIÉ DE LA COPIE DÉPLOYÉE LE 11/09. Il y avait été écrit
+# directement, sans passer par une branche : il ne vivait donc dans AUCUN dépôt,
+# et le prochain déploiement l'aurait écrasé sans bruit. Un correctif appliqué
+# en production est un correctif qui sera perdu ; le seul endroit sûr est la
+# branche d'où part le déploiement.
+#
+# ⚠️ En le rapatriant, une contradiction corrigée : le commentaire déployé
+# affirmait « IL VAUT "" ICI : ce déploiement ne bascule RIEN » alors que la
+# ligne suivante portait "__refonte_20260909". Le commentaire datait de la
+# valeur d'avant, la valeur a changé sans lui. C'est la VALEUR qui fait foi, et
+# `_UNIFIED_CODE_COLLECTION` vaut bien la collection suffixée — un témoin de
+# smoke le vérifie désormais, pour qu'on ne reperde pas la bascule une
+# troisième fois.
 #
 # La bascule n'est PAS un renommage. Les anciennes collections restent en base —
 # elles sont le retour arrière immédiat — et tout ce qui EXCLUAIT les collections
-# de codes des listes de documents doit continuer de le faire pour les deux
+# de codes des listes de documents doit continuer de le faire pour les DEUX
 # régimes à la fois.
 _SUFFIXE_CODES = "__refonte_20260909"
 
@@ -858,6 +874,42 @@ def _est_collection_de_code(name: str) -> bool:
     return any(name == b or name.startswith(b + "__") for b in _BASES_CODES)
 
 
+# --- LES COLLECTIONS DE CORPUS : lues par un chemin dédié, JAMAIS comme un
+# --- document versé par l'utilisateur ---------------------------------------
+# `QuestionOrale` a fuité ici le 11/09 : créée le matin, elle n'était ni un code,
+# ni de l'infrastructure, ni dans la liste littérale — donc elle entrait dans
+# `search_uploaded_documents`, et des réponses orales de séance arrivaient au
+# prompt comme des fichiers versés. C'est le défaut pour lequel 883
+# transcriptions ont été supprimées le 10/09, revenu par une autre porte.
+#
+# ⚠️ L'onglet, lui, ne la montrait PAS — par accident : son filtre exige
+# « "_" in name », et « QuestionOrale » n'en contient aucun. Le défaut était
+# donc INVISIBLE dans l'interface et ACTIF dans le prompt. Les deux sites ne
+# portaient pas la même règle ; ils la partagent désormais.
+_COLLECTIONS_CORPUS = ("QuestionParlementaire", "QuestionOrale")
+
+
+def _est_collection_de_corpus(name: str) -> bool:
+    """Un corpus interrogé par un chemin dédié, quel que soit son suffixe."""
+    return any(name == b or name.startswith(b + "__") for b in _COLLECTIONS_CORPUS)
+
+
+def _est_collection_document(name: str) -> bool:
+    """LA règle, en un seul endroit : un document versé n'est ni un corpus, ni
+    un code, ni de l'infrastructure de recherche.
+
+    ⚠️ Sa limite, à dire plutôt qu'à laisser découvrir : elle repose sur une
+    ÉNUMÉRATION (`_COLLECTIONS_CORPUS`). Une collection de corpus créée demain
+    et non déclarée ici fuitera exactement comme `QuestionOrale` — aucun test ne
+    peut connaître une collection que personne n'a déclarée. **Créer une
+    collection de corpus, c'est l'ajouter à ce tuple**, et le témoin de smoke
+    s'étend alors tout seul.
+    """
+    return not (_est_collection_de_corpus(name)
+                or _est_collection_de_code(name)
+                or _is_legal_infra_collection(name))
+
+
 def _is_legal_infra_collection(name: str) -> bool:
     """Collections d'infrastructure de la recherche juridique (vecteurs NOMMÉS
     `dense`/`bm25`, ou sparse seul) : `CodesJuridiques` et les compagnes
@@ -865,6 +917,10 @@ def _is_legal_infra_collection(name: str) -> bool:
     `qdrant_client.search()` à vecteur simple s'y solde par un 400 « Not existing
     vector name ». À exclure de `search_uploaded_documents` et des sélecteurs de
     documents de l'UI.
+
+    Le `startswith` porte sur la BASE et non sur la collection suffixée : sans
+    lui, la collection unifiée de refonte n'est pas reconnue comme
+    infrastructure, et un `search()` à vecteur simple y échoue en 400.
     """
     return (name == _BASE_UNIFIEE or name.startswith(_BASE_UNIFIEE + "__")
             or name.endswith("__bm25"))
@@ -1030,8 +1086,74 @@ def extraire_articles_cites(text: str) -> list:
     return out[:6]
 
 
-def lookup_articles_par_num(nums: list, collections: list, debug: bool = False) -> list:
-    """Récupère par filtre exact `num` chaque article cité (provenance='cited', score sentinelle haut)."""
+# =====================================================================
+# QUEL CODE POUR UN ARTICLE CITÉ — INERTE (`CODE_CITE_PAR_LA_QUESTION`)
+# ---------------------------------------------------------------------
+# Défaut corrigé : `lookup_articles_par_num` parcourait les collections dans
+# l'ordre d'une constante et s'arrêtait au PREMIER succès. Pour les 155 numéros
+# cités portés par plusieurs codes (21,5 % des 722 distincts), c'était donc
+# l'ordre de la liste qui choisissait le code, jamais la question — et le
+# résultat entrait en TÊTE du bloc, avec un score sentinelle de 3,0.
+#
+# Règle retenue, mesures et réserves : `reference/conception_code_des_articles_cites.md`.
+# En deux lignes : la question nomme un seul code et le numéro y existe → cet
+# article seul (80,3 % des questions citantes nomment un code ; l'heuristique
+# est juste à 97,5 % sur les cas vérifiables) ; sinon → tous les codes portant
+# le numéro (+1 article en médiane, sur 4,6 % des questions citantes).
+# =====================================================================
+CODE_CITE_PAR_LA_QUESTION = False
+
+# Motifs volontairement LARGES : manquer une mention ferait basculer la citation
+# dans le repli, ce qui est le comportement sûr mais dilue le bloc pour rien.
+_CODES_NOMMES = {
+    "CASF": re.compile(r"code de l'action sociale|action sociale et des familles|\bCASF\b", re.I),
+    "Code du travail": re.compile(r"code du travail", re.I),
+    "Code de la santé publique": re.compile(r"code de la sant[ée] publique|\bCSP\b", re.I),
+    "Code de la sécurité sociale": re.compile(r"code de la s[ée]curit[ée] sociale|\bCSS\b", re.I),
+}
+
+
+def codes_nommes_dans(question: str) -> list:
+    """Les codes que la question nomme explicitement. Heuristique de TEXTE.
+
+    ⚠️ « la question nomme ce code » n'est PAS « la citation appartient à ce
+    code » : mesuré, l'écart est de 18 citations sur 714 (2,5 %). C'est la
+    raison d'être de la double condition dans `lookup_articles_par_num` — le
+    numéro doit AUSSI exister dans le code nommé, sinon on élargit.
+    """
+    return [c for c, motif in _CODES_NOMMES.items() if motif.search(question or "")]
+
+
+def _articles_du_num(num: str, collections: list) -> tuple:
+    """TOUS les (collection, point) portant ce numéro, et les codes EN ÉCHEC.
+
+    ⚠️ Les échecs sont rendus, pas avalés. Une collection injoignable ne dit
+    pas « le numéro n'y est pas », elle ne dit RIEN — et sans cette distinction
+    une panne passagère produirait la mention « introuvable dans les quatre
+    codes », qui serait alors FAUSSE. C'est le défaut que le projet a déjà
+    corrigé sur la boucle par collection de `search_articles` ; le garde-fou du
+    smoke (« le `continue` nu ... a disparu ») l'a rattrapé ici.
+    """
+    trouves, echecs = [], []
+    for coll in collections:
+        try:
+            pts, _ = qdrant_client.scroll(
+                collection_name=coll,
+                scroll_filter=Filter(must=[FieldCondition(key="num", match=MatchValue(value=num))]),
+                limit=1, with_payload=True, with_vectors=False,
+            )
+            if pts:
+                trouves.append((coll, pts[0]))
+        except Exception as exc:  # noqa: BLE001
+            echecs.append(f"{coll} ({type(exc).__name__})")
+    return trouves, echecs
+
+
+def _lookup_ordre_liste(nums: list, collections: list, debug: bool = False) -> list:
+    """CHEMIN DE PRODUCTION, conservé tel quel — le code choisi par l'ORDRE de
+    la liste. Extrait ici sans une modification de comportement, pour que le
+    chemin corrigé ne l'imbrique pas d'un niveau : c'est ce que vérifie le
+    témoin « numéro mono-code, résultat identique inerte/actif »."""
     found = []
     for num in nums:
         hit = None
@@ -1054,6 +1176,58 @@ def lookup_articles_par_num(nums: list, collections: list, debug: bool = False) 
         art = {**(hit.payload or {}), "provenance": "cited", "score": 3.0}
         art.setdefault("collection", coll)
         found.append(art)
+    return found
+
+
+def lookup_articles_par_num(nums: list, collections: list, debug: bool = False,
+                            question: str = "") -> list:
+    """Récupère par filtre exact `num` chaque article cité (provenance='cited', score sentinelle haut)."""
+    if not CODE_CITE_PAR_LA_QUESTION:
+        return _lookup_ordre_liste(nums, collections, debug)
+
+    nommes = codes_nommes_dans(question)
+    found = []
+    for num in nums:
+        trouves, echecs = _articles_du_num(num, collections)
+        if not trouves:
+            # L'ABSENCE EST DITE, pas tue. Auparavant : un `print` vers le
+            # journal du serveur, et rien dans le prompt — le parlementaire
+            # citait un article précis, le modèle ne recevait rien à son sujet
+            # et RIEN ne lui disait qu'il n'avait pas été trouvé. Même famille
+            # que « un contexte vidé se lirait comme rien trouvé » (_reduire_bloc)
+            # et que F15. Mesuré : 10,8 % des questions citantes.
+            #
+            # Le message est NEUTRE SUR LA CAUSE : abrogé, appartenant à un code
+            # hors des quatre, coquille du parlementaire — je ne l'ai pas établi,
+            # donc il ne dit que ce qui est vrai.
+            if debug:
+                print(f"  article cité {num} : introuvable dans les codes")
+            found.append({
+                "num": num, "titre": "", "collection": "", "contexte_hierarchique": "",
+                # Deux phrases DIFFÉRENTES, parce que ce sont deux faits
+                # différents : « il n'y est pas » et « on n'a pas pu regarder ».
+                "contenu": (
+                    f"Article {num} — cité dans la question, introuvable dans "
+                    "les quatre codes interrogés. N'en citez pas le contenu : "
+                    "il n'a pas été fourni."
+                    if not echecs else
+                    f"Article {num} — cité dans la question. La recherche n'a "
+                    f"pas pu aboutir ({', '.join(echecs)}) : on ignore s'il "
+                    "existe. N'en citez pas le contenu, et n'en concluez pas "
+                    "qu'il n'existe pas."),
+                "provenance": "cited_absent", "score": 3.0,
+            })
+            continue
+        # Règle 1 : la question nomme UN SEUL code ET le numéro y existe.
+        retenus = trouves
+        if len(nommes) == 1:
+            cible = [t for t in trouves if t[0] == nommes[0]]
+            if cible:
+                retenus = cible
+        for coll, hit in retenus:
+            art = {**(hit.payload or {}), "provenance": "cited", "score": 3.0}
+            art.setdefault("collection", coll)
+            found.append(art)
     return found
 
 
@@ -1109,6 +1283,12 @@ def search_articles(
     vide = {"sources": [], "total": 0, "limit": limit, "offset": 0,
             "echec": None, "collections_en_echec": [], "mode": None}
 
+    # LA BASCULE PASSE ICI. Avec les noms littéraux, `search_articles`
+    # sert les ANCIENNES collections quel que soit `_SUFFIXE_CODES` --
+    # le gain d'attribution mesuré (6,9 % -> 0,0 % de points mal
+    # attribués) disparaîtrait de la production sans qu'aucun test ne
+    # tombe. Un témoin de smoke vérifie désormais que
+    # `_UNIFIED_CODE_COLLECTION` porte bien le suffixe.
     target_collections = list(_CODE_COLLECTIONS)
     try:
         collections = qdrant_client.get_collections()
@@ -1248,9 +1428,21 @@ def search_articles(
             for art in final_articles:
                 if art.get("num") in articles_cites:
                     art["provenance"] = "cited"
-            manquants = [n for n in articles_cites if n not in seen]
+            # ⚠️ On compare des NUMÉROS à des numéros. `seen` porte désormais des
+            # couples `(num, collection)` depuis a899154 — la clé d'identité —,
+            # et un numéro nu n'est jamais égal à un couple : la condition était
+            # TOUJOURS vraie. Conséquence mesurée : tout article cité était
+            # re-cherché dans Qdrant même déjà remonté, puis ajouté en tête, et
+            # le modèle recevait DEUX FOIS le même article.
+            #
+            # Le test porte bien sur le numéro seul, et c'est voulu : la question
+            # cite « l'article L114-5 » sans dire de quel code. On ne peut pas
+            # exiger la collection d'une citation qui ne la donne pas.
+            nums_presents = {a.get("num") for a in final_articles}
+            manquants = [n for n in articles_cites if n not in nums_presents]
             if manquants:
-                forces = lookup_articles_par_num(manquants, valid_collections, debug=debug)
+                forces = lookup_articles_par_num(manquants, valid_collections,
+                                                 debug=debug, question=query)
                 if debug and forces:
                     print(f"Articles cités forcés dans le contexte : {[a.get('num') for a in forces]}")
                 final_articles = forces + final_articles
@@ -1826,14 +2018,19 @@ def search_uploaded_documents(
     all_results = []
     try:
         # 1. Récupère les collections à rechercher
-        # `_est_collection_de_code` couvre les deux régimes à la fois : le
-        # corpus servi ET les collections de refonte, qui coexistent en base.
-        protected = {"QuestionParlementaire"}
+        # Les quatre noms LITTÉRAUX ont été remplacés par `_est_collection_de_code`,
+        # qui couvre les deux régimes à la fois : le corpus servi ET les
+        # collections de refonte, qui coexistent en base. Avec la liste
+        # littérale, les collections suffixées n'étaient pas reconnues et
+        # entraient ici comme des fichiers versés par l'utilisateur — des
+        # articles de loi servis comme des documents.
+        # UNE SEULE règle, partagée avec l'onglet documents. Les deux sites
+        # avaient divergé -- l'un exigeait « "_" in name », l'autre non --, et
+        # c'est cette divergence qui a rendu la fuite de `QuestionOrale`
+        # invisible dans l'interface tout en la laissant ACTIVE dans le prompt.
         collections = qdrant_client.get_collections()
         doc_collections = [col.name for col in collections.collections
-                           if col.name not in protected
-                           and not _est_collection_de_code(col.name)
-                           and not _is_legal_infra_collection(col.name)]
+                           if _est_collection_document(col.name)]
 
         # 2. Limite aux collections sélectionnées si spécifiées
         if selected_collections:
@@ -2036,6 +2233,122 @@ def format_uploaded_docs_by_relevance(
         )
 
     return "\n---\n".join(formatted)
+
+# =====================================================================
+# POSITIONS EXPRIMÉES EN SÉANCE — INERTE (`POSITIONS_ORALES`)
+# ---------------------------------------------------------------------
+# Une réponse orale N'EST PAS un modèle de rédaction : c'est pour cela que 883
+# transcriptions de séance ont été supprimées de `QuestionParlementaire` le
+# 10/09. Elle n'entre donc PAS dans le CONTEXTE PARLEMENTAIRE, dont la consigne
+# dit qu'il sert « au registre, au ton et aux axes » et que ses chiffres sont
+# « datés, donc présumés périmés ».
+#
+# Elle entre dans un bloc PROPRE, après RECHERCHE INTERNET — même famille,
+# « daté et sourcé » —, comme une SOURCE DATÉE À CITER : date de séance,
+# chambre, orateur nommé, position, lien.
+#
+# BLOCAGE LEVÉ LE 11/09 — les vecteurs portent bien le champ `question`, donc
+# comparer l'embedding de la question de l'utilisateur a un sens. La source est
+# le workflow d'ingestion lui-même, `.github/workflows/ingest-oraux.yml` :
+# `modele.encode([p["question"] for p in points])`. Ni `reponse`, ni la
+# concaténation — même convention que `QuestionParlementaire`.
+#
+# ⚠️ À RETENIR : ma mesure de corrélation classait `question+reponse` EN TÊTE
+# (+0,346 contre +0,248), c'est-à-dire **pas** le champ réellement encodé. Son
+# seuil (écart < 0,05) a refusé de conclure, et c'est la seule raison pour
+# laquelle on n'a pas retenu la mauvaise réponse : un maximum de corrélation
+# n'identifie pas une source. Détail : `reference/conception_positions_orales.md`.
+#
+# Ce qui reste avant activation n'est plus une inconnue mais une décision : le
+# réglage change le prompt en production, donc il s'active sur accord explicite.
+# =====================================================================
+POSITIONS_ORALES = False
+_COLLECTION_ORALES = "QuestionOrale"
+# Budget du bloc. La position médiane fait 2 029 caractères ; trois entrées
+# tiennent donc dans ~1 500 tokens, l'ordre de grandeur du bloc parlementaire.
+ORALES_TOP_K = 3
+ORALES_CAR_MAX = 1200
+# ⚠️ `truncate_text` compte en TOKENS, pas en caractères (`max_chars =
+# max_tokens * 4`, app.py:69). Lui passer 1 200 couperait à 4 800 caractères,
+# soit QUATRE FOIS le budget annoncé ci-dessus — et rien ne l'aurait signalé,
+# le bloc serait simplement trop gros.
+ORALES_TOK_MAX = ORALES_CAR_MAX // 4
+
+# Copie assumée du motif de `qe_rag/extract.py`. La règle du projet est
+# d'importer plutôt que de recopier, mais `qe_rag` PEUT ÊTRE ABSENT DU
+# DÉPLOIEMENT (voir le message d'app.py:432) : un import au chargement du module
+# casserait l'application entière là où le module manque. La copie est donc
+# imposée par le déploiement, pas choisie — et `tests/smoke/` porte un test de
+# parité qui INJECTE le motif depuis `qe_rag.extract` au lieu de le redire.
+# Forme `</?[A-Za-z!]...` et non `<[^>]+>` : cette dernière avalait les seuils
+# non échappés (« R < 6,5 % » devenait « R 6,5 % »).
+_BALISE_ORALE = re.compile(r"(?s)</?[A-Za-z!][^>]*>")
+
+
+def search_positions_orales(query: str, top_k: int = ORALES_TOP_K) -> List[Dict]:
+    """Positions exprimées en séance, les plus proches de `query`.
+
+    Rend une liste de payloads bruts — le formatage est séparé, pour qu'il soit
+    testable sans réseau. Rend `[]` sur toute erreur : ce chemin est un ajout,
+    il ne doit jamais empêcher une réponse d'être produite.
+    """
+    try:
+        embedding = embedding_model.encode(query).tolist()
+        hits = qdrant_client.query_points(
+            collection_name=_COLLECTION_ORALES,
+            query=embedding,
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False,
+        ).points
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ Positions orales indisponibles ({type(exc).__name__}: {exc}).")
+        return []
+    return [dict(h.payload or {}, _score=getattr(h, "score", None)) for h in hits]
+
+
+def format_positions_orales(points: List[Dict], car_max: int = ORALES_CAR_MAX) -> str:
+    """Le bloc POSITIONS EXPRIMÉES EN SÉANCE.
+
+    ⚠️ L'ORATEUR EST NOMMÉ, JAMAIS LE MINISTÈRE. `concordance_ministere` vaut
+    `diverge` sur 94 des 351 points (26,8 %) : sur plus d'un quart des entrées,
+    le ministre présent n'appartient pas au ministère attributaire. Une position
+    attribuée à une personne est toujours vraie ; attribuée à un ministère, elle
+    est fausse une fois sur quatre. Les entrées divergentes portent en plus une
+    mention explicite, pour que le modèle ne les généralise pas.
+    """
+    if not points:
+        return ""
+    blocs = []
+    for p in points:
+        date = str(p.get("date_reponse") or "")[:10]
+        chambre = p.get("chambre") or ""
+        type_q = p.get("type_question") or ""
+        entete = " · ".join(x for x in (date, chambre, type_q) if x)
+        orateur = (p.get("ministre_nom") or "orateur non identifié").strip()
+        # `reponse` = le tour de parole du ministre, isolé. PAS `verbatim_seance`,
+        # qui est le transcript brut de la séance : du HTML sur 351/351, médiane
+        # 5 345 caractères, et il contient les tours de parole des autres.
+        texte = _BALISE_ORALE.sub(" ", p.get("reponse") or "")
+        texte = re.sub(r"\s+", " ", _html.unescape(texte)).strip()
+        if len(texte) > car_max:
+            # En TOKENS — voir la note sur `ORALES_TOK_MAX`.
+            texte = truncate_text(texte, max_tokens=car_max // 4)
+        ligne = [f"[{entete}] {orateur}", f"« {texte} »"]
+        if (p.get("concordance_ministere") or "") == "diverge":
+            ligne.append("⚠️ réponse portée par un autre ministère que "
+                         "l'attributaire : la position engage l'orateur, "
+                         "pas le ministère saisi.")
+        if p.get("url_source"):
+            ligne.append(f"source : {p['url_source']}")
+        blocs.append("\n".join(ligne))
+    # Séparateur = LIGNE VIDE, et ce n'est pas cosmétique : `_reduire_bloc`
+    # découpe sur "\n\n" pour retirer des entrées ENTIÈRES. Avec un séparateur
+    # à lui, le bloc aurait été insécable — compté dans la fenêtre, jamais
+    # allégeable, et c'est « TEXTES JURIDIQUES » (dernier sacrifié, donc le
+    # plus protégé) qui aurait payé sa place.
+    return "\n\n".join(blocs)
+
 
 # Fonction de recherches d'anciennes questions / réponses dans le RAG Qdrant
 def search_question_parlementaire(query: str, top_k: int = 5) -> List[ResponseDocument]:
@@ -2564,6 +2877,11 @@ def formater_article_pour_prompt(art: dict, max_tokens: int,
     réécrite jusqu'à 25 fois dans un seul prompt : 15,3 % du bloc juridique,
     ≈ 673 tokens par question, pour zéro information ajoutée.
     """
+    if art.get("provenance") == "cited_absent":
+        # La mention porte deja son propre libelle complet : lui ajouter
+        # l'en-tete « Article X — » le repeterait, et la troncature au budget
+        # pourrait couper la phrase qui dit justement de ne rien citer.
+        return (art.get("contenu") or "").strip()
     code, position = _situation_article(art)
     situation = code
     if position:
@@ -2602,10 +2920,15 @@ def sort_articles_for_prompt(articles: List[dict]) -> List[dict]:
     2. Les articles enrichis associés à chaque article initial, dans l'ordre des articles initiaux.
     """
     # 1. Séparer : articles cités dans la question (F2) > initiaux > enrichis
-    cited_articles = [art for art in articles if art.get("provenance") == "cited"]
+    # `cited_absent` va AVEC les cités : c'est la mention qui remplace un
+    # article cité introuvable. La reléguer parmi les enrichis la ferait tomber
+    # en fin de bloc, loin de la question à laquelle elle répond -- et c'est
+    # précisément le premier candidat à la troncature.
+    _CITES = ("cited", "cited_absent")
+    cited_articles = [art for art in articles if art.get("provenance") in _CITES]
     initial_articles = [art for art in articles if art.get("provenance") == "initial"]
     enriched_articles = [art for art in articles
-                         if art.get("provenance") not in ("initial", "cited")]
+                         if art.get("provenance") not in ("initial",) + _CITES]
 
     # 2. Trier les articles initiaux par score décroissant
     initial_articles_sorted = sorted(
@@ -3172,6 +3495,10 @@ def _decompte_tokens_prompt(question, parlementaire, juridique, documents, inter
 #     donc il ne peut pas mordre sur un cas qui fonctionne : c'est vrai par
 #     construction, pas par calibrage.
 _ORDRE_SACRIFICE = (
+    # Sacrifié EN PREMIER : c'est l'ajout le plus récent et le moins portant.
+    # Absent du dictionnaire quand `POSITIONS_ORALES` est inerte -- `blocs.get`
+    # rend "" et la boucle passe, donc aucune trace et aucun effet.
+    ("positions_orales", "positions en séance"),
     ("parliamentary_context", "contexte parlementaire"),
     ("search_context", "recherche internet"),
     ("uploaded_documents", "documents de référence"),
@@ -3277,6 +3604,99 @@ _LONGUEUR_MOTS = {
     "Longue": "900 à 1200 mots",
 }
 
+# =====================================================================
+# Vivier d'ouvertures, tiré au sort par question — INERTE (`VIVIER_OUVERTURES`)
+# ---------------------------------------------------------------------
+# Pourquoi. Le 08/09, retirer les phrases d'ouverture citées en exemple a rendu
+# le modèle PLUS rigide, pas moins : 1 seule formule sur 7 cas, contre 2 pour le
+# prompt qu'il remplaçait. L'hypothèse qui en sort — et que ce réglage teste —
+# est que **les exemples n'étaient pas la cause de la rigidité mais sa seule
+# protection** : privé de choix, le modèle retombe sur son défaut propre, unique.
+#
+# Ce qui varie est donc le GESTE — par quoi la réponse entre dans le dossier —
+# et non la formulation : vingt façons de dire « le sujet est important » sont
+# un seul geste, et un comptage par formule y verrait un faux succès.
+#
+# Le vivier est un fichier du dépôt, PAS du RAG : rien à retrouver par
+# proximité de sens, seulement à tirer. L'utilisateur l'édite sans réingérer.
+# ⚠️ DÉPLOIEMENT : `ouvertures_gestes.md` doit être poussé vers `QE_app` À CÔTÉ
+#    d'`app.py`. S'il manque, le tirage est vide et le prompt revient à la
+#    version héritée — dégradation silencieuse, d'où le contrôle au smoke.
+# =====================================================================
+VIVIER_OUVERTURES = False
+GRAINE_OUVERTURES: Optional[int] = None   # None = tirage libre ; un entier = reproductible
+GESTES_TIRES = 3
+FICHIER_OUVERTURES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ouvertures_gestes.md")
+
+# Les amorces héritées, retirées SEULEMENT quand le vivier est actif : elles
+# font toutes le même geste, et le laisser en tête privilégierait ce geste-là.
+# Chaînes exactes — un contrôle vérifie qu'elles sont bien présentes à l'inerte.
+_AMORCES_HERITEES = (
+    "Commencez par **souligner l'importance du sujet** pour le Gouvernement, sans reprendre les termes critiques du parlementaire. "
+    "Utilisez des formulations comme : "
+    "'Ce sujet est une priorité pour le Gouvernement, comme en témoignent [mesures existantes]', "
+    "'Le Gouvernement est pleinement conscient des enjeux liés à [thème]', "
+    "'Cette question, essentielle pour [public concerné], fait l'objet d'une attention constante de la part des services de l'État'. ",
+    "1. **Reconnaissez l'importance du sujet** (sans valider les critiques) : "
+    "'La question que vous soulevez touche à un enjeu majeur pour [public concerné], auquel le Gouvernement apporte une réponse structurée.' ",
+    "Utilisez des formulations comme : "
+    "'Votre proposition s'inscrit dans une dynamique que le Gouvernement partage, comme en attestent [mesures existantes].' "
+    "'Nous partageons votre préoccupation pour [enjeu], et nos actions vont dans le sens de [objectif], comme le montre [exemple].' ",
+)
+
+
+def charger_vivier_ouvertures(chemin: Optional[str] = None) -> Dict[str, List[str]]:
+    """Lit le vivier. Une ligne `# ` ouvre un geste, les `- ` sont ses exemples.
+
+    Un geste sans exemple est ignoré : c'est ce qui laisse écrire de la prose
+    dans le fichier sans qu'elle soit prise pour un geste. Fichier absent ou
+    illisible -> dictionnaire vide, jamais d'exception.
+    """
+    try:
+        with open(chemin or FICHIER_OUVERTURES, encoding="utf-8") as f:
+            lignes = f.read().splitlines()
+    except OSError:
+        return {}
+    vivier: Dict[str, List[str]] = {}
+    courant = None
+    for ligne in lignes:
+        if ligne.startswith("# "):
+            courant = ligne[2:].strip()
+            vivier.setdefault(courant, [])
+        elif ligne.startswith("- ") and courant:
+            ex = ligne[2:].strip()
+            if ex:
+                vivier[courant].append(ex)
+    return {g: ex for g, ex in vivier.items() if ex}
+
+
+def tirer_gestes_ouverture(question: str, n: int = GESTES_TIRES,
+                           graine: Optional[int] = None,
+                           vivier: Optional[Dict[str, List[str]]] = None) -> str:
+    """Tire `n` gestes distincts et un exemple de chacun. Bloc vide si pas de vivier.
+
+    Reproductibilité : avec une graine (argument ou `GRAINE_OUVERTURES`), le
+    tirage est **stable pour une question donnée** et varie d'une question à
+    l'autre — c'est ce qu'il faut pour que `feat/eval` compare deux bras sans
+    que le hasard s'ajoute à l'écart mesuré. Sans graine, tirage libre.
+    """
+    v = charger_vivier_ouvertures() if vivier is None else vivier
+    if not v:
+        return ""
+    g = GRAINE_OUVERTURES if graine is None else graine
+    rng = random.Random(f"{g}|{question}") if g is not None else random.Random()
+    gestes = rng.sample(sorted(v), k=min(n, len(v)))
+    lignes = [
+        "- Ouverture — entrez dans le dossier par l'un des gestes ci-dessous, "
+        "celui que CETTE question appelle. Les exemples montrent à quoi "
+        "ressemble chaque entrée ; ils portent sur d'autres sujets et ne sont "
+        "pas des phrases à reprendre."
+    ]
+    for geste in gestes:
+        lignes.append(f"  • {geste} — par exemple : « {rng.choice(v[geste])} »")
+    return "\n".join(lignes)
+
 
 # Construit le message `user` de l'appel à Mistral (le `system` est
 # SYSTEME_REPONSE_PARLEMENTAIRE, ajouté par call_mistral_parliamentary_response).
@@ -3292,6 +3712,10 @@ def build_parlementary_response_prompt(
     search_context: str,
     subquestions: Optional[List[str]] = None,
     consignes_sous_questions: Optional[Dict[str, str]] = None,
+    # Bloc DÉJÀ FORMATÉ (par `format_positions_orales`), pas une liste de points :
+    # il doit pouvoir entrer dans le dictionnaire que `reduire_contextes_pour_tenir`
+    # allège, comme les quatre autres contextes.
+    positions_orales: str = "",
 ) -> str:
     """
     Construit le message `user` : question, contexte récupéré (parlementaire,
@@ -3342,6 +3766,35 @@ def build_parlementary_response_prompt(
 
     now = datetime.now(pytz.timezone("Europe/Paris"))
     date_du_jour = f"{now.day} {_MOIS_FR[now.month]} {now.year}"
+
+    # Vivier actif : on retire les amorces héritées (toutes le même geste) et on
+    # injecte les gestes tirés. Inerte : le prompt est celui de la production,
+    # aux octets près -- c'est le contrôle du smoke.
+    orientation_txt = orientation_mapping.get(response_orientation, "")
+    bloc_ouvertures = ""
+    if VIVIER_OUVERTURES:
+        tire = tirer_gestes_ouverture(question)
+        if tire:
+            for _amorce in _AMORCES_HERITEES:
+                orientation_txt = orientation_txt.replace(_amorce, "")
+            bloc_ouvertures = chr(10) + tire
+
+    # Cinquième bloc, POSITIONS EXPRIMÉES EN SÉANCE. Inerte : la chaîne est
+    # VIDE, donc le prompt est celui de la production aux octets près -- c'est
+    # ce que vérifie le témoin négatif du smoke, pas une relecture.
+    bloc_orales = ""
+    if POSITIONS_ORALES:
+        _entrees = (positions_orales or "").strip()
+        if _entrees:
+            bloc_orales = (
+                chr(10) + chr(10)
+                + "POSITIONS EXPRIMÉES EN SÉANCE — ce que le Gouvernement a dit "
+                  "oralement, daté et attribué à la personne qui l'a dit. "
+                  "À CITER, pas à imiter : le registre oral n'est pas celui "
+                  "d'une réponse écrite. N'attribuez la position qu'à son "
+                  "orateur, jamais à un ministère."
+                + chr(10) + _entrees
+            )
 
     detail = detail_juridique if detail_juridique in _DETAIL_JURIDIQUE else 3
     detail_consigne = _DETAIL_JURIDIQUE[detail]
@@ -3399,10 +3852,10 @@ DOCUMENTS DE RÉFÉRENCE
 {uploaded_documents}
 
 RECHERCHE INTERNET — actualités et positions du Gouvernement. Chaque résultat est daté et sourcé. Une entrée marquée « TEXTE PUBLIÉ » atteste que le texte visé est paru : tenez-le pour publié (et applicable à sa date d'entrée en vigueur), jamais pour « à venir » ou « en préparation ».
-{search_context}
+{search_context}{bloc_orales}
 
 CONSIGNES DE RÉDACTION
-- Orientation : {orientation_mapping.get(response_orientation, "")}
+- Orientation : {orientation_txt}{bloc_ouvertures}
 - Les crochets [ … ] des tournures ci-dessus sont des emplacements : remplacez-les par un élément des contextes fournis, ou reformulez la phrase sans eux. Aucun crochet ne doit subsister dans la réponse.
 - Avant de rédiger, repérez dans les contextes fournis les éléments qui répondent DIRECTEMENT à la question : texte applicable et sa succession, décision de justice, échéance, chiffre daté, position récente du Gouvernement. Construisez la réponse dessus. Ne restez pas au niveau général quand un contexte contient une réponse précise ; à l'inverse, si aucun contexte ne traite frontalement une demande, dites-le (sujet à l'étude, non tranché) sans meubler.
 - Corps de la réponse : rappel du cadre juridique et des chiffres disponibles, puis mesures en cours en privilégiant les plus récentes et l'année budgétaire courante. Intégrez les éléments des documents de référence puis de la recherche internet sans nommer la source.
@@ -4039,13 +4492,21 @@ def generate_response(
                 **blocs,
             )
 
+        # POSITIONS EXPRIMÉES EN SÉANCE — inerte par défaut. Quand le réglage
+        # est à False on n'ajoute même pas la clé : le dictionnaire de blocs est
+        # celui de la production, donc le prompt aussi, aux octets près.
+        _blocs_contexte = {
+            "parliamentary_context": parliamentary_context,
+            "legal_context": legal_context,
+            "uploaded_documents": uploaded_docs_context,
+            "search_context": search_context,
+        }
+        if POSITIONS_ORALES:
+            _blocs_contexte["positions_orales"] = format_positions_orales(
+                search_positions_orales(question))
+
         _blocs, _reduction = reduire_contextes_pour_tenir(
-            {
-                "parliamentary_context": parliamentary_context,
-                "legal_context": legal_context,
-                "uploaded_documents": uploaded_docs_context,
-                "search_context": search_context,
-            },
+            _blocs_contexte,
             _limite_prompt, _construire, SYSTEME_REPONSE_PARLEMENTAIRE,
         )
         if _reduction:
@@ -4428,19 +4889,16 @@ else:
             collections = qdrant_client.get_collections()
             collection_names = [col.name for col in collections.collections]
 
-            protected_collections = {"QuestionParlementaire"}
-
-            # Filtre pour ne garder que les collections "documents" (ex: "NomDuDocument_2023")
+            # Même règle qu'à l'injection (`_est_collection_document`), pour que
+            # l'onglet montre EXACTEMENT ce que le modèle reçoit. Le
+            # « "_" in name » reste propre à l'affichage : c'est la convention
+            # de nommage des documents versés, et elle n'a jamais protégé de
+            # rien -- « QuestionOrale » n'en contient aucun et fuitait quand
+            # même du côté du prompt.
             doc_collections = [
                 name for name in collection_names
-                # `"_" in name` suffisait tant que les collections de codes
-                # n'avaient que des espaces. Celles de refonte portent
-                # « __refonte_<date> » : sans l'exclusion explicite, elles
-                # apparaissent ici comme des documents versés.
-                if name not in protected_collections
-                and not _est_collection_de_code(name)
+                if _est_collection_document(name)
                 and "_" in name  # Ex: "MonDocument_2023"
-                and not _is_legal_infra_collection(name)
             ]
 
             if not doc_collections:
