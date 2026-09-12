@@ -615,6 +615,34 @@ def search_tavily_government(subject: str, min_score: float = 0.5):
 
     return data
 
+_SECRET_DANS_URL = re.compile(r"(?i)([?&](?:key|api[_-]?key|token|cx)=)[^&\s]+")
+
+
+def sans_secrets(texte: str) -> str:
+    """Retire les identifiants d'une chaîne avant de la montrer ou de la servir.
+
+    ⚠️ POURQUOI CETTE FONCTION EXISTE. `requests` place les paramètres DANS
+    L'URL, et le message d'une `HTTPError` contient l'URL complète. Une erreur
+    de la recherche Google porte donc `key=<la vraie clé>` dans son texte — et
+    le gestionnaire d'erreur de `generate_response` affiche `str(e)` dans le
+    champ « response », c'est-à-dire À L'ÉCRAN. Vérifié le 12/09.
+    """
+    return _SECRET_DANS_URL.sub(r"[RETIRÉ]", texte or "")
+
+
+def _date_publication_google(resultat: dict) -> Optional[str]:
+    """Date de publication d'UN résultat Google, ou None.
+
+    Extraite une seule fois, pour que le filtre par date et le formatage final
+    ne puissent pas diverger : ils lisaient la même chose à deux endroits, et
+    l'un des deux lisait en fait la variable de boucle de l'autre.
+    """
+    metas = (resultat.get("pagemap") or {}).get("metatags") or []
+    if not metas:
+        return None
+    return metas[0].get("article:published_time")
+
+
 # Fonction de recherche Google
 def search_google_government(subject: str,
                              min_score: float = 0.5,
@@ -655,7 +683,7 @@ def search_google_government(subject: str,
     cutoff = datetime.now() - timedelta(days=365)
     recent = []
     for r in by_domain:
-        date_str = r.get("pagemap", {}).get("metatags", [{}])[0].get("article:published_time")
+        date_str = _date_publication_google(r)
         if date_str:
             try:
                 pub = datetime.fromisoformat(date_str.replace("Z", ""))
@@ -678,7 +706,15 @@ def search_google_government(subject: str,
             "url": r.get("link", ""),
             "content": r.get("snippet", ""),   # Tavily utilisait "content"
             "score": 1.0,                      # Valeur par défaut
-            "published_date": date_str if r.get("pagemap", {}).get("metatags") else None
+            # ⚠️ RECALCULÉE POUR CE RÉSULTAT-CI. Avant le 12/09 cette ligne
+            # lisait `date_str`, la variable laissée par la boucle de filtre
+            # ci-dessus — donc la date du DERNIER résultat filtré, recopiée sur
+            # TOUS. Chaque résultat du bloc internet portait ainsi la date d'un
+            # autre, ou aucune, alors que l'en-tête du bloc affirme au modèle
+            # que « chaque résultat est daté et sourcé ». Sur la seule source
+            # vivante du critère 1, et alors que le critère 4 exige des dates
+            # exactes. Défaut trouvé par `feat/eval` en portant ce code.
+            "published_date": _date_publication_google(r)
         })
 
     return {"results": results}
@@ -1101,7 +1137,29 @@ def extraire_articles_cites(text: str) -> list:
 # est juste à 97,5 % sur les cas vérifiables) ; sinon → tous les codes portant
 # le numéro (+1 article en médiane, sur 4,6 % des questions citantes).
 # =====================================================================
-CODE_CITE_PAR_LA_QUESTION = False
+# ACTIVÉ le 12/09 sur accord de l'utilisateur (le plus mûr des trois réglages :
+# mesuré, codé, témoins écrits). SUR LA BRANCHE, pas en production — le
+# déploiement se redemande au moment du geste.
+#
+# ⚠️ CE QUE L'ACTIVATION NE COUVRE PAS, trouvé en vérifiant les DEUX chemins de
+# service comme la coordination l'a demandé. Ce réglage n'agit que dans
+# `lookup_articles_par_num`, donc dans le RATTRAPAGE F2 — et le rattrapage est
+# SAUTÉ quand le numéro cité figure déjà dans les résultats :
+#
+#     nums_presents = {a.get("num") for a in final_articles}   (app.py:1441)
+#
+# La clé est le NUMÉRO SEUL. Si la recherche hybride a déjà remonté `L114-5`
+# depuis le CASF alors que la question nomme la sécurité sociale, le rattrapage
+# ne se déclenche pas, et le réglage n'a jamais l'occasion de choisir le bon
+# code. L'activation n'améliore donc que les cas où le chemin nominal n'avait
+# PAS remonté le numéro.
+#
+# Ce n'est pas une bascule à moitié au sens du 10/09 — le chemin nominal ne
+# force aucun article, il remonte par pertinence et le prompt situe chaque
+# article dans son code (F7). Mais la portée réelle est plus petite qu'elle
+# n'y paraît, et un témoin rend cette limite visible au lieu de la laisser
+# latente. L'élargir serait un autre geste, pas celui-ci.
+CODE_CITE_PAR_LA_QUESTION = True
 
 # Motifs volontairement LARGES : manquer une mention ferait basculer la citation
 # dans le repli, ce qui est le comportement sûr mais dilue le bloc pour rien.
@@ -2267,7 +2325,41 @@ _COLLECTION_ORALES = "QuestionOrale"
 # Budget du bloc. La position médiane fait 2 029 caractères ; trois entrées
 # tiennent donc dans ~1 500 tokens, l'ordre de grandeur du bloc parlementaire.
 ORALES_TOP_K = 3
-ORALES_CAR_MAX = 1200
+
+# =====================================================================
+# LE PLAFOND PAR ENTRÉE DU BLOC POSITIONS — un seul, pour TOUTE provenance
+# ---------------------------------------------------------------------
+# `feat/fiches` produit des positions d'origine ÉCRITE (citation courte, 500
+# caractères) ; ce fichier en produit d'origine ORALE. Question posée le 12/09 :
+# où déclarer le plafond commun, pour ne pas avoir deux constantes qui
+# divergent ?
+#
+# RÉPONSE : il n'y a rien à partager, parce que LE PLAFOND N'APPARTIENT PAS AU
+# PRODUCTEUR. C'est une propriété du BUDGET DU PROMPT, pas du fait. Un
+# producteur de fiches ne peut d'ailleurs pas importer `app.py` — il tournerait
+# en CI sans streamlit ni Qdrant, et j'ai passé trois tours de CI sur exactement
+# ce genre d'import hier. Le producteur stocke ce que son jugement éditorial
+# retient ; le PROMPT plafonne à la mise en forme, pour toutes les entrées,
+# quelle que soit leur origine.
+#
+# POURQUOI UN PLAFOND UNIFORME, et c'est mesuré : `_reduire_bloc` retire des
+# entrées ENTIÈRES EN PARTANT DE LA QUEUE. Mesure du 12/09 sur un bloc mixte de
+# 6 entrées (2 longues, 4 courtes en queue) : pour libérer 50 tokens il a retiré
+# TROIS entrées courtes et gardé les deux longues. Des entrées de poids inégal
+# rendent donc la réduction incohérente — les courtes meurent en nombre pour
+# presque rien.
+#
+# ⚠️ 1 200 EST UNE HYPOTHÈSE NON MESURÉE, et elle le reste. `feat/fiches` dit la
+# même chose de son 500 : « hypothèse écrite avant tout test réel ». Aucune des
+# deux n'a été confrontée à un budget de contexte. Ce qui trancherait est à la
+# portée du budget de validation : faire lire dix entrées plafonnées à 500 et
+# dix à 1 200, et dire si la position survit à la coupe. Tant que ce n'est pas
+# fait, je garde la valeur en service plutôt que d'en adopter une autre tout
+# aussi arbitraire — changer un nombre non mesuré pour un autre nombre non
+# mesuré n'est pas un progrès, c'est un déplacement.
+POSITION_CAR_MAX = 1200
+# Ancien nom, conservé le temps que les deux producteurs se rejoignent.
+ORALES_CAR_MAX = POSITION_CAR_MAX
 # ⚠️ `truncate_text` compte en TOKENS, pas en caractères (`max_chars =
 # max_tokens * 4`, app.py:69). Lui passer 1 200 couperait à 4 800 caractères,
 # soit QUATRE FOIS le budget annoncé ci-dessus — et rien ne l'aurait signalé,
@@ -2342,6 +2434,14 @@ def format_positions_orales(points: List[Dict], car_max: int = ORALES_CAR_MAX) -
         if p.get("url_source"):
             ligne.append(f"source : {p['url_source']}")
         blocs.append("\n".join(ligne))
+    # ⚠️ CONTRAT D'ORDRE, ajouté le 12/09 à la demande de `feat/fiches`.
+    # Les entrées sont rendues DANS L'ORDRE OÙ ELLES ARRIVENT, sans tri ici. Ce
+    # n'est pas un détail d'implémentation : `_reduire_bloc` retire les entrées
+    # EN PARTANT DE LA QUEUE, donc **l'ordre reçu EST l'ordre de survie** — ce
+    # qu'on met en dernier est ce qu'on accepte de perdre en cas de saturation.
+    # Le producteur décide donc de ce qui survit, et il doit le savoir.
+    # C'était vrai par construction ; c'est désormais un contrat testé, parce
+    # qu'une propriété vraie par accident se casse sans qu'on la voie.
     # Séparateur = LIGNE VIDE, et ce n'est pas cosmétique : `_reduire_bloc`
     # découpe sur "\n\n" pour retirer des entrées ENTIÈRES. Avec un séparateur
     # à lui, le bloc aurait été insécable — compté dans la fenêtre, jamais
@@ -3494,16 +3594,278 @@ def _decompte_tokens_prompt(question, parlementaire, juridique, documents, inter
 #     nous coûter une régression. Ici il n'est borné QUE pendant la dégradation,
 #     donc il ne peut pas mordre sur un cas qui fonctionne : c'est vrai par
 #     construction, pas par calibrage.
-_ORDRE_SACRIFICE = (
-    # Sacrifié EN PREMIER : c'est l'ajout le plus récent et le moins portant.
-    # Absent du dictionnaire quand `POSITIONS_ORALES` est inerte -- `blocs.get`
-    # rend "" et la boucle passe, donc aucune trace et aucun effet.
-    ("positions_orales", "positions en séance"),
-    ("parliamentary_context", "contexte parlementaire"),
-    ("search_context", "recherche internet"),
-    ("uploaded_documents", "documents de référence"),
-    ("legal_context", "textes juridiques"),
+# =====================================================================
+# LA PRIORITÉ DES BLOCS, DÉCLARÉE UNE SEULE FOIS  (chantier D)
+# ---------------------------------------------------------------------
+# Avant : la priorité entre sources vivait à DEUX endroits qui pouvaient
+# diverger — l'ordre des blocs dans le f-string du prompt, et `_ORDRE_SACRIFICE`
+# qui décide lequel est amputé quand la fenêtre sature. Deux encodages de la
+# même notion, et une règle écrite à deux endroits finit par diverger en
+# silence : ça s'est produit deux fois le 11/09 (l'écran et le prompt pour les
+# collections ; la clé d'identité et son test de présence).
+#
+# ⚠️ CE QUE CETTE DÉCLARATION N'UNIFIE PAS, ET C'EST VOULU.
+# Il y a DEUX ordres distincts, pas un :
+#   · `rang_prompt`     — où le bloc APPARAÎT dans le prompt (ordre de lecture) ;
+#   · `rang_protection` — ce qui SURVIT quand la fenêtre sature.
+# Ils n'ont aucune raison de coïncider, et les fondre en un seul nombre
+# produirait une abstraction qui n'est vraie d'aucun des deux. Une troisième
+# priorité existe encore — l'ordre des ARTICLES à l'intérieur du bloc juridique
+# (`sort_articles_for_prompt`, par provenance) — et elle reste DEHORS : elle
+# ordonne des articles, pas des blocs. C'est un autre axe.
+#
+# `criteres` = les critères de la liste ordonnée de l'utilisateur (10/09) que le
+# bloc sert, du plus prioritaire au moins. C'est un TUPLE et non un seul nombre :
+# un bloc en sert souvent plusieurs, et n'en retenir qu'un a failli me faire
+# écrire que RECHERCHE INTERNET ne sert pas le critère 1 — alors que son en-tête
+# dit littéralement « actualités et positions du Gouvernement ». Le rang qui
+# compte pour une comparaison est le PLUS HAUT, donc `min()`.
+# Ils sont déclarés pour que la divergence entre ce que nous protégeons et ce
+# que l'utilisateur a classé soit LISIBLE — voir `divergences_priorite()`.
+# Cette déclaration ne CHANGE aucune priorité : elle les rend visibles. Les
+# changer est un arbitrage, pas un remaniement.
+#
+# Chaque bloc : (clé dans le dict de contextes, étiquette de trace,
+#                en-tête dans le prompt, rang_prompt, rang_protection, critère)
+# `rang_protection` : 1 = sacrifié EN PREMIER, 5 = protégé jusqu'au bout.
+_BLOCS_PROMPT = (
+    ("parliamentary_context", "contexte parlementaire",
+     "CONTEXTE PARLEMENTAIRE", 1, 2, (5,)),
+    ("legal_context", "textes juridiques",
+     "TEXTES JURIDIQUES APPLICABLES", 2, 5, (4,)),
+    ("uploaded_documents", "documents de référence",
+     "DOCUMENTS DE RÉFÉRENCE", 3, 4, (4,)),
+    ("search_context", "recherche internet",
+     "RECHERCHE INTERNET", 4, 3, (1, 4)),
+    # POSITIONS EXPRIMÉES EN SÉANCE — inerte (`POSITIONS_ORALES`). Absent du
+    # dictionnaire tant que le réglage l'est : `blocs.get` rend "" et la boucle
+    # passe, donc aucune trace et aucun effet.
+    #
+    # ⚠️ Son `rang_protection` de 1 est celui que je lui ai donné le 11/09, au
+    # motif qu'il était « l'ajout le plus récent et le moins portant ». La liste
+    # ordonnée de l'utilisateur dit l'inverse : ce bloc est la seule source du
+    # critère 1, LE SEUL QUI DISQUALIFIE. Le rang est donc probablement faux —
+    # mais le corriger est un ARBITRAGE, pas un remaniement, et il se décide
+    # avec l'activation du réglage puisque c'est la même question.
+    ("positions_orales", "positions en séance",
+     "POSITIONS EXPRIMÉES EN SÉANCE", 5, 1, (1,)),
+    # =================================================================
+    # LA SAISIE DU RÉDACTEUR — DÉCLARÉE, PAS ENCORE RENDUE
+    # -----------------------------------------------------------------
+    # `entete = None` signifie : ce bloc a une PLACE, il n'a pas encore de
+    # FORME. C'est la distinction exacte du mandat — la place est un rang, la
+    # forme est un objet — et `ordre_des_entetes()` saute les blocs non rendus.
+    #
+    # POURQUOI IL EXISTE : le critère 3 demande d'annoncer qu'un sujet va être
+    # traité. Aucune source publique ne porte cette information, et
+    # l'utilisateur a dit qu'il en disposerait nécessairement au moment de
+    # rédiger. C'est donc une ENTRÉE, pas une récupération — et la seule source
+    # du système dont la fiabilité soit établie par l'utilisateur lui-même.
+    #
+    # `rang_protection = 6`, le plus haut, et ce n'est pas un arbitrage laissé
+    # ouvert : sacrifier ce que l'utilisateur a écrit lui-même pour garder ce
+    # qu'un moteur a retrouvé serait absurde dans tous les cas de figure.
+    #
+    # `rang_prompt = 6` est PROVISOIRE au sens strict : il ne peut pas être
+    # faux tant que le bloc n'est pas rendu, et il sera décidé avec la forme.
+    #
+    # ⚠️ CE QUI NE PEUT PAS SE DÉCIDER SANS LA FORME, et je m'arrête là plutôt
+    # que de choisir : `criteres` vaut `(3,)`. Si le champ admet aussi que le
+    # rédacteur ÉNONCE une position (« le Gouvernement s'oppose à … »), alors il
+    # sert aussi le critère 1 — et ce n'est pas cosmétique : `blocs_du_critere(1)`
+    # commande le déclenchement de l'abstention (C1). Un champ rempli qui ne
+    # compterait pas comme source de position ferait s'abstenir le modèle alors
+    # que le rédacteur vient de lui donner la réponse. La forme décide donc du
+    # critère, et le critère décide d'un comportement : les deux ne se séparent
+    # pas. Voir `reference/saisie_redacteur_place.md`.
+    ("saisie_redacteur", "information du rédacteur",
+     None, 6, 6, (3,)),
 )
+
+# DÉRIVÉ, jamais récrit. Le moins protégé d'abord.
+_ORDRE_SACRIFICE = tuple(
+    (cle, etiquette) for cle, etiquette, _e, _rp, _prot, _c
+    in sorted(_BLOCS_PROMPT, key=lambda b: b[4])
+)
+
+
+def ordre_des_entetes() -> list:
+    """Les en-têtes de blocs dans l'ordre où le prompt doit les présenter.
+
+    Sert au témoin de parité : le f-string du prompt reste littéral — le
+    réécrire pour le dériver changerait le prompt à l'octet, ce qu'on s'interdit
+    ici — mais un test compare l'ordre réellement produit à CETTE liste. La
+    divergence devient donc impossible sans qu'un test tombe, ce qui est la
+    garantie qu'on cherchait ; la dérivation textuelle ne l'est pas.
+    """
+    return [e for _c, _et, e, _rp, _prot, _cr
+            in sorted(_BLOCS_PROMPT, key=lambda b: b[3]) if e is not None]
+
+
+def divergences_priorite() -> list:
+    """Où ce que nous PROTÉGEONS contredit ce que l'utilisateur a CLASSÉ.
+
+    Rend une liste de couples (mieux_protégé, moins_protégé) dont le critère
+    servi est pourtant moins prioritaire — critère 1 étant le plus haut. Une
+    liste non vide n'est pas un défaut de code : c'est une question d'arbitrage,
+    et l'intérêt de la déclaration est qu'elle la rende lisible au lieu de la
+    laisser dans deux mécanismes.
+
+    ⚠️ CE QUE CETTE FONCTION NE SAIT PAS DIRE, découvert en déclarant la saisie
+    du rédacteur le 12/09. Elle compare DEUX axes — protection et critère servi
+    — alors qu'il en existe un TROISIÈME : la FIABILITÉ de la source. La saisie
+    du rédacteur sert le critère 3, donc elle apparaît ici comme « trop
+    protégée » face aux sources du critère 1 ; or elle est la seule source dont
+    la fiabilité soit établie par l'utilisateur lui-même, et la sacrifier pour
+    garder ce qu'un moteur a retrouvé n'aurait de sens dans aucun cas.
+
+    Je ne complète PAS la fonction d'un troisième axe : je n'ai aucune mesure
+    pour ordonner les fiabilités, et un axe inventé serait pire que l'axe
+    manquant. Les couples qui viennent de `saisie_redacteur` sont donc des
+    divergences PAR CONSTRUCTION, à lire comme telles et non comme des
+    arbitrages — le témoin de smoke les sépare des deux vraies.
+    """
+    out = []
+    for cle_a, _ea, _ha, _pa, prot_a, crits_a in _BLOCS_PROMPT:
+        for cle_b, _eb, _hb, _pb, prot_b, crits_b in _BLOCS_PROMPT:
+            if prot_a > prot_b and min(crits_a) > min(crits_b):
+                out.append((cle_a, cle_b))
+    return out
+
+
+# =====================================================================
+# C1 — L'ABSTENTION : dire qu'on ne sait pas, au lieu d'inférer  (INERTE)
+# ---------------------------------------------------------------------
+# « Un système qui ne peut pas disqualifier sa propre réponse ne peut pas
+# respecter un critère disqualifiant. » L'application sait dire « la recherche
+# juridique a ÉCHOUÉ » ; elle ne sait pas dire « je ne connais pas la position
+# du Gouvernement sur ce point ». Or le critère 1 DISQUALIFIE : se taire y vaut
+# mieux qu'affirmer.
+#
+# ⚠️ OÙ CETTE RÈGLE VIT, puisque Coordination demande qu'elle soit déclarée et
+# non tenue de tête : PAS dans `_BLOCS_PROMPT`. L'abstention n'est pas un bloc
+# de source, c'est une règle sur ce qui se passe quand les sources d'un critère
+# sont toutes vides. La ranger parmi les blocs serait la sur-unification qu'on
+# vient d'écarter deux fois. Elle a donc sa déclaration propre — mais le lien
+# critère → blocs est DÉRIVÉ de `_BLOCS_PROMPT` par `blocs_du_critere()`, et
+# n'est jamais réécrit ici. Sa PLACE dans le prompt est le bloc CONSIGNES DE
+# RÉDACTION, qui est l'endroit des instructions.
+ABSTENTION_POSITION = False
+
+# ⚠️ UN BLOC VIDE NE L'EST PAS LITTÉRALEMENT. Quand rien n'est trouvé, les blocs
+# reçoivent une PHRASE SENTINELLE (`app.py` ~4461, ~4481, ~4556). Un test de
+# vérité naïf (`if search_context:`) serait donc TOUJOURS vrai, l'abstention ne
+# se déclencherait jamais, et le contrôle aurait l'air de passer tout en ne
+# faisant rien — exactement le défaut d'instrument qu'on paie depuis une
+# semaine. Les sentinelles sont énumérées ici, et un témoin de smoke vérifie que
+# chacune existe encore TELLE QUELLE dans ce fichier : en renommer une fait
+# tomber le test au lieu de désactiver l'abstention en silence.
+_SENTINELLES_VIDE = (
+    "Aucun contexte parlementaire trouvé.",
+    "Aucun texte juridique spécifique n'a été identifié.",
+    "Aucune recherche internet effectuée.",
+    # ⚠️ AJOUTÉE LE 12/09, ET ELLE MANQUAIT. `formater_recherche_internet` rend
+    # cette phrase quand aucun résultat n'est exploitable. Elle fait 36
+    # caractères : mon plancher de 40 la rattrapait PAR CHANCE, à quatre
+    # caractères près. Une reformulation un peu plus longue aurait rouvert le
+    # trou sans qu'aucun test ne tombe.
+    "Aucun résultat internet exploitable.",
+    # ⚠️ La phrase de PANNE n'est PAS ici : elle est dans
+    # `_ANNOTATIONS_SANS_CONTENU`, parce qu'elle doit être retirée jusqu'à la
+    # fin du paragraphe et non par correspondance exacte. L'avoir mise dans LES
+    # DEUX listes cassait le mécanisme : la boucle des sentinelles retirait le
+    # préfixe, après quoi la boucle des annotations ne trouvait plus son amorce
+    # et laissait le reste de la phrase — qui repassait le plancher. Deux
+    # mécanismes corrects qui, appliqués l'un après l'autre, s'annulent.
+)
+
+# ⚠️ ET CE QUI M'AVAIT ÉCHAPPÉ COMPLÈTEMENT : un bloc vide peut être vide ET
+# ANNOTÉ. `search_context` reçoit en plus « (Peu de résultats pertinents : N
+# résultat(s) écarté(s)…) », et `_reduire_bloc` ajoute « (Bloc réduit : …) ».
+# Un bloc valant « Aucun résultat internet exploitable. » + la note fait 125
+# caractères : mon test « contient une sentinelle → vide » échouait, et le bloc
+# comptait comme une SOURCE DE POSITION. C'est-à-dire que l'abstention ne se
+# déclenchait pas dans le cas exact où elle existe.
+#
+# D'où le changement de principe : on RETIRE tout ce qui n'est pas du contenu,
+# puis on regarde ce qui reste. « Contenir une sentinelle » ne compose pas ;
+# « retirer puis mesurer le reste » compose.
+_ANNOTATIONS_SANS_CONTENU = (
+    "Peu de résultats pertinents",
+    "Bloc réduit",
+    # ⚠️ ICI ET NON DANS `_SENTINELLES_VIDE`, et la nuance a coûté un test rouge.
+    # Une sentinelle est retirée par correspondance EXACTE ; or cette phrase
+    # porte un motif variable et une phrase d'explication. La déclarer comme
+    # sentinelle n'en retirait que le PRÉFIXE, et le reste — « Ce n'est pas une
+    # absence de résultat : on ignore… » — repassait le plancher de substance,
+    # donc comptait comme une SOURCE DE POSITION. Retirée jusqu'à la fin du
+    # paragraphe, comme les annotations.
+    "La recherche internet n'a PAS PU avoir lieu",
+)
+# Plancher de substance : sous ce seuil, un bloc ne porte rien d'exploitable
+# (les doublures de test passent « — »). Ceinture ET bretelles avec les
+# sentinelles, parce qu'une sentinelle neuve ajoutée ailleurs ne serait pas ici.
+_MIN_CAR_BLOC_UTILE = 40
+
+_ABSTENTION_PAR_CRITERE = {
+    1: ("Aucune source fournie n'établit la position du Gouvernement sur le "
+        "point soulevé. N'en affirmez aucune et n'en déduisez aucune : "
+        "rappelez le cadre applicable, et indiquez que le sujet fait l'objet "
+        "d'un examen, sans prêter au Gouvernement une orientation que rien "
+        "ici n'atteste."),
+}
+
+
+def bloc_porte_quelque_chose(texte: str) -> bool:
+    """Le bloc porte-t-il autre chose qu'une phrase de « rien trouvé » ?
+
+    On RETIRE les phrases sans contenu, puis on mesure le RESTE — au lieu de
+    tester « contient une sentinelle ». La différence n'est pas stylistique :
+    un bloc peut être vide ET annoté, et le test par contenance échouait
+    exactement là (voir la note sur `_ANNOTATIONS_SANS_CONTENU`).
+    """
+    t = (texte or "").strip()
+    for phrase in _SENTINELLES_VIDE:
+        t = t.replace(phrase, " ")
+    # ⚠️ On coupe de l'amorce jusqu'a la FIN DU PARAGRAPHE, pas jusqu'a la
+    # premiere parenthese fermante. Mon premier motif faisait `\([^)]*\)` et il
+    # etait faux : la note contient elle-meme des parentheses -- « resultat(s)
+    # ecarte(s) » -- donc il s'arretait apres « resultat( » et laissait 44
+    # caracteres de residu, assez pour repasser le plancher. Meme forme de
+    # defaut que `<[^>]+>` qui avalait les seuils « < 6,5 % ».
+    for amorce in _ANNOTATIONS_SANS_CONTENU:
+        # La parenthèse ouvrante est OPTIONNELLE : les deux annotations
+        # d'origine en ont une, la phrase de panne n'en a pas.
+        t = re.sub(r"\(?\s*" + re.escape(amorce) + r".*?(?:" + chr(10)
+                   + r"\s*" + chr(10) + r"|$)", " ", t, flags=re.S)
+    return len(re.sub(r"\s+", " ", t).strip()) >= _MIN_CAR_BLOC_UTILE
+
+
+def consignes_abstention(valeurs: dict) -> list:
+    """Les consignes d'abstention à ajouter, vu le contenu réel des blocs.
+
+    `valeurs` : {clé de bloc -> texte servi}. Pour chaque critère déclaré, si
+    AUCUN de ses blocs sources ne porte quelque chose, on rend sa consigne.
+    """
+    out = []
+    for critere, consigne in sorted(_ABSTENTION_PAR_CRITERE.items()):
+        sources = blocs_du_critere(critere)
+        if sources and not any(bloc_porte_quelque_chose(valeurs.get(c, ""))
+                               for c in sources):
+            out.append(consigne)
+    return out
+
+
+def blocs_du_critere(n: int) -> tuple:
+    """Les clés des blocs qui servent le critère `n`.
+
+    Dérivé de la déclaration, jamais réécrit : c'est le premier usage réel de
+    `_BLOCS_PROMPT` au-delà de l'ordre de sacrifice, et il montre à quoi elle
+    sert. `blocs_du_critere(1)` = les sources de la position du Gouvernement,
+    donc du seul critère qui DISQUALIFIE.
+    """
+    return tuple(cle for cle, _e, _h, _rp, _prot, crits in _BLOCS_PROMPT
+                 if n in crits)
 
 
 def _reduire_bloc(texte: str, tokens_a_liberer: int) -> tuple:
@@ -3796,6 +4158,23 @@ def build_parlementary_response_prompt(
                 + chr(10) + _entrees
             )
 
+    # C1 — ABSTENTION. Inerte : la chaîne est VIDE, donc le prompt est celui de
+    # la production aux octets près. Les valeurs viennent des paramètres du
+    # constructeur ; la liste des blocs à consulter est DÉRIVÉE de la
+    # déclaration (`blocs_du_critere`), jamais réécrite ici.
+    bloc_abstention = ""
+    if ABSTENTION_POSITION:
+        _valeurs_blocs = {
+            "parliamentary_context": parliamentary_context,
+            "legal_context": legal_context,
+            "uploaded_documents": uploaded_documents,
+            "search_context": search_context,
+            "positions_orales": positions_orales,
+        }
+        _cons = consignes_abstention(_valeurs_blocs)
+        if _cons:
+            bloc_abstention = "".join(chr(10) + "- " + c for c in _cons)
+
     detail = detail_juridique if detail_juridique in _DETAIL_JURIDIQUE else 3
     detail_consigne = _DETAIL_JURIDIQUE[detail]
     if detail >= 2:
@@ -3855,7 +4234,7 @@ RECHERCHE INTERNET — actualités et positions du Gouvernement. Chaque résulta
 {search_context}{bloc_orales}
 
 CONSIGNES DE RÉDACTION
-- Orientation : {orientation_txt}{bloc_ouvertures}
+- Orientation : {orientation_txt}{bloc_ouvertures}{bloc_abstention}
 - Les crochets [ … ] des tournures ci-dessus sont des emplacements : remplacez-les par un élément des contextes fournis, ou reformulez la phrase sans eux. Aucun crochet ne doit subsister dans la réponse.
 - Avant de rédiger, repérez dans les contextes fournis les éléments qui répondent DIRECTEMENT à la question : texte applicable et sa succession, décision de justice, échéance, chiffre daté, position récente du Gouvernement. Construisez la réponse dessus. Ne restez pas au niveau général quand un contexte contient une réponse précise ; à l'inverse, si aucun contexte ne traite frontalement une demande, dites-le (sujet à l'étude, non tranché) sans meubler.
 - Corps de la réponse : rappel du cadre juridique et des chiffres disponibles, puis mesures en cours en privilégiant les plus récentes et l'année budgétaire courante. Intégrez les éléments des documents de référence puis de la recherche internet sans nommer la source.
@@ -4428,6 +4807,7 @@ def generate_response(
         search_context = "Aucune recherche internet effectuée."
         search_results = []
 
+        _panne_internet = ""
         search_engine = st.session_state.get("search_engine")
         if search_engine:
             status_placeholder.markdown(
@@ -4435,10 +4815,37 @@ def generate_response(
                 unsafe_allow_html=True
             )
 
-            if search_engine == "Tavily":
-                results = search_tavily_government(extract_subject(question))
-            else:  # Google
-                results = search_google_government(extract_subject(question))
+            # ⚠️ AUCUN `try` ICI JUSQU'AU 12/09. `raise_for_status()` remontait
+            # au gestionnaire externe, qui rend « Erreur lors de la génération »
+            # A LA PLACE DE LA REPONSE : une panne Google, un quota dépassé ou
+            # une clé absente supprimaient le projet de réponse entier, alors
+            # que le corpus, les textes juridiques et les fiches étaient là.
+            #
+            # L'utilisateur a tranché le principe le 12/09, pour une autre
+            # cause : « l'outil ne peut pas répondre je ne sais pas ». Une
+            # réponse à une question écrite est toujours rédigée.
+            try:
+                if search_engine == "Tavily":
+                    results = search_tavily_government(extract_subject(question))
+                else:  # Google
+                    results = search_google_government(extract_subject(question))
+            except Exception as exc:  # noqa: BLE001
+                # DEUX PHRASES DISTINCTES, et ce n'est pas cosmétique : « la
+                # recherche n'a rien donné » et « la recherche n'a pas eu lieu »
+                # ne disent pas la même chose au rédacteur. Dans le second cas
+                # il peut relancer plus tard ; dans le premier, non.
+                #
+                # ⚠️ SEUL LE TYPE DE L'EXCEPTION EST SERVI, JAMAIS SON MESSAGE :
+                # celui-ci contient l'URL complète, donc la clé API.
+                motif = type(exc).__name__
+                print(f"⚠️ Recherche internet indisponible ({motif}).")
+                results = {"results": []}
+                _panne_internet = (
+                    "La recherche internet n'a PAS PU avoir lieu "
+                    f"({motif}). Ce n'est pas une absence de résultat : on "
+                    "ignore ce qu'elle aurait donné. N'en concluez pas qu'il "
+                    "n'y a pas d'actualité sur ce sujet, et ne présentez "
+                    "aucune position comme récente sur cette seule base.")
             # F3 : doublons et résultats hors sujet écartés (la liste filtrée est
             # aussi celle affichée dans l'onglet — le modèle et l'utilisateur voient la même chose)
             search_results, _ecartes = filtrer_resultats_internet(results.get("results", []), question)
@@ -4448,7 +4855,11 @@ def generate_response(
                 TOKEN_LIMITS[current_model_size]['search_context'],
                 answer=results.get("answer", ""),
             )
-            if _ecartes and len(search_results) < 3:
+            if _panne_internet:
+                # La panne l'emporte sur le formatage : le bloc ne doit pas
+                # ressembler à « rien trouvé ».
+                search_context = _panne_internet
+            elif _ecartes and len(search_results) < 3:
                 search_context += (f"\n\n(Peu de résultats pertinents : {_ecartes} résultat(s) "
                                    "écarté(s) comme hors sujet ou en doublon.)")
 
@@ -4578,8 +4989,11 @@ def generate_response(
         # plancher (système + squelette + question) vaut ~2 900 tokens.
         return {
             "question": question,
-            "response": f"Erreur lors de la génération de la réponse : {str(e)}",
-            "error": str(e),
+            # `sans_secrets` : un message d'exception peut porter une URL avec
+            # `key=…`. Élargissement assumé du correctif de la recherche
+            # internet — il ferme le chemin résiduel pour toutes les autres.
+            "response": f"Erreur lors de la génération de la réponse : {sans_secrets(str(e))}",
+            "error": sans_secrets(str(e)),
             "legal_sources": legal_sources,
             "similar_documents": similar_documents,
             "search_results": search_results,
