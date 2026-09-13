@@ -75,6 +75,23 @@ from qe_prompt import (  # noqa: E402
     divergences_priorite,
     ordre_des_entetes,
     tirer_gestes_ouverture,
+    LEGISLATURE_COURANTE,
+    ORALES_CAR_MAX,
+    ORALES_TOK_MAX,
+    POSITION_CAR_MAX,
+    _BALISE_ORALE,
+    _NOMS_CODES,
+    _PROX_TRAME_MIN,
+    _TRAME_AGE_MAX_ANNEES,
+    _legislature_de,
+    _position_dans_le_code,
+    _situation_article,
+    annoter_qe_contexte,
+    format_positions_orales,
+    formater_article_pour_prompt,
+    formater_articles_pour_prompt,
+    safe_parse_date,
+    truncate_text,
 )
 
 from PyPDF2 import PdfReader
@@ -118,23 +135,7 @@ def estimate_tokens(text):
     """Estime le nombre de tokens pour Mistral Large (1 token ≈ 4 caractères en français)."""
     return len(text) // 4
 
-# Fonction utilitaire pour tronquer le texte
-def truncate_text(text: str, max_tokens: int = 500) -> str:
-    """Tronque un texte à un nombre maximal de tokens (1 token ≈ 4 caractères)."""
-    max_chars = max_tokens * 4
-    return (text[:max_chars] + "...") if len(text) > max_chars else text
 
-# Fonction de conversion des dates
-def safe_parse_date(date_str: Optional[str]) -> datetime:
-    """Convertit une date hétérogène en datetime, ou datetime.min si invalide."""
-    if not date_str:
-        return datetime.min
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return datetime.min
 
 # Masquer les messages de warning de pdfminer
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
@@ -621,13 +622,40 @@ def extract_subject(question: str) -> str:
 # C'est la même forme que tout ce qu'on corrige depuis deux jours : une règle
 # écrite à deux endroits finit par diverger. Une seule déclaration, deux
 # lecteurs.
+# ⚠️ CETTE LISTE DOIT RESTER ALIGNEE SUR LA CONSOLE GOOGLE, qui en porte sa
+# propre copie -- et c'est la seule copie qu'on ne maitrise pas depuis le code.
+# Google Custom Search restreint les sites DANS LA CONSOLE, pas dans la requete :
+# le code ne peut que FILTRER ce qu'elle a bien voulu rendre. Une divergence ne
+# leve donc jamais, elle retire silencieusement des resultats.
+#
+# Relevee le 13/09 par l'utilisateur, qui a compare les deux a la main : la
+# console portait deux ministeres qui n'existent plus sous cette forme. Il a
+# corrige la console (21 domaines), ce cote-ci suit.
+#
+#   + ansm.sante.fr            la penurie de medicaments est le 2e sujet le plus
+#                              frequent des questions, et aucun domaine ne la
+#                              couvrait
+#   + travail-emploi.gouv.fr   le ministere a eclate en trois ; ce site manquait
+#                              DES DEUX COTES
+#   - travail-sante-solidarites.gouv.fr   ancienne configuration ministerielle,
+#                              n'a jamais rien rendu sur 80 questions
+#
+# `solidarites.gouv.fr` reste : le code l'avait juste, c'est la console qui
+# portait l'ancien nom. Et `drees.solidarites-sante.gouv.fr` garde son nom malgre
+# l'eclatement -- verifie avec l'utilisateur, pas deduit de la reorganisation.
+#
+# ⚠️ LA DOUBLE COPIE EST UN ARTEFACT DU MOTEUR, PAS UN CHOIX. Google Search API
+# ferme le 01/01/2027. Tout remplacant qui prend les sites DANS LA REQUETE
+# (Serper, SerpApi) fait disparaitre la copie distante, et cette liste redevient
+# la seule. C'est un critere de choix, ecrit dans
+# `reference/saturation_et_options.md`.
 _DOMAINES_GOUV = (
     "gouvernement.fr", "info.gouv.fr", "elysee.fr", "vie-publique.fr",
     "education.gouv.fr", "solidarites.gouv.fr", "sante.gouv.fr",
-    "travail-sante-solidarites.gouv.fr", "securite-sociale.fr", "ameli.fr",
+    "travail-emploi.gouv.fr", "securite-sociale.fr", "ameli.fr",
     "lassuranceretraite.fr", "caf.fr", "msa.fr", "urssaf.fr",
     "legifrance.gouv.fr", "drees.solidarites-sante.gouv.fr", "ars.sante.fr",
-    "cnsa.fr", "en3s.fr", "francetravail.fr",
+    "ansm.sante.fr", "cnsa.fr", "en3s.fr", "francetravail.fr",
 )
 
 
@@ -2364,55 +2392,7 @@ _COLLECTION_ORALES = "QuestionOrale"
 # tiennent donc dans ~1 500 tokens, l'ordre de grandeur du bloc parlementaire.
 ORALES_TOP_K = 3
 
-# =====================================================================
-# LE PLAFOND PAR ENTRÉE DU BLOC POSITIONS — un seul, pour TOUTE provenance
-# ---------------------------------------------------------------------
-# `feat/fiches` produit des positions d'origine ÉCRITE (citation courte, 500
-# caractères) ; ce fichier en produit d'origine ORALE. Question posée le 12/09 :
-# où déclarer le plafond commun, pour ne pas avoir deux constantes qui
-# divergent ?
-#
-# RÉPONSE : il n'y a rien à partager, parce que LE PLAFOND N'APPARTIENT PAS AU
-# PRODUCTEUR. C'est une propriété du BUDGET DU PROMPT, pas du fait. Un
-# producteur de fiches ne peut d'ailleurs pas importer `app.py` — il tournerait
-# en CI sans streamlit ni Qdrant, et j'ai passé trois tours de CI sur exactement
-# ce genre d'import hier. Le producteur stocke ce que son jugement éditorial
-# retient ; le PROMPT plafonne à la mise en forme, pour toutes les entrées,
-# quelle que soit leur origine.
-#
-# POURQUOI UN PLAFOND UNIFORME, et c'est mesuré : `_reduire_bloc` retire des
-# entrées ENTIÈRES EN PARTANT DE LA QUEUE. Mesure du 12/09 sur un bloc mixte de
-# 6 entrées (2 longues, 4 courtes en queue) : pour libérer 50 tokens il a retiré
-# TROIS entrées courtes et gardé les deux longues. Des entrées de poids inégal
-# rendent donc la réduction incohérente — les courtes meurent en nombre pour
-# presque rien.
-#
-# ⚠️ 1 200 EST UNE HYPOTHÈSE NON MESURÉE, et elle le reste. `feat/fiches` dit la
-# même chose de son 500 : « hypothèse écrite avant tout test réel ». Aucune des
-# deux n'a été confrontée à un budget de contexte. Ce qui trancherait est à la
-# portée du budget de validation : faire lire dix entrées plafonnées à 500 et
-# dix à 1 200, et dire si la position survit à la coupe. Tant que ce n'est pas
-# fait, je garde la valeur en service plutôt que d'en adopter une autre tout
-# aussi arbitraire — changer un nombre non mesuré pour un autre nombre non
-# mesuré n'est pas un progrès, c'est un déplacement.
-POSITION_CAR_MAX = 1200
-# Ancien nom, conservé le temps que les deux producteurs se rejoignent.
-ORALES_CAR_MAX = POSITION_CAR_MAX
-# ⚠️ `truncate_text` compte en TOKENS, pas en caractères (`max_chars =
-# max_tokens * 4`, app.py:69). Lui passer 1 200 couperait à 4 800 caractères,
-# soit QUATRE FOIS le budget annoncé ci-dessus — et rien ne l'aurait signalé,
-# le bloc serait simplement trop gros.
-ORALES_TOK_MAX = ORALES_CAR_MAX // 4
 
-# Copie assumée du motif de `qe_rag/extract.py`. La règle du projet est
-# d'importer plutôt que de recopier, mais `qe_rag` PEUT ÊTRE ABSENT DU
-# DÉPLOIEMENT (voir le message d'app.py:432) : un import au chargement du module
-# casserait l'application entière là où le module manque. La copie est donc
-# imposée par le déploiement, pas choisie — et `tests/smoke/` porte un test de
-# parité qui INJECTE le motif depuis `qe_rag.extract` au lieu de le redire.
-# Forme `</?[A-Za-z!]...` et non `<[^>]+>` : cette dernière avalait les seuils
-# non échappés (« R < 6,5 % » devenait « R 6,5 % »).
-_BALISE_ORALE = re.compile(r"(?s)</?[A-Za-z!][^>]*>")
 
 
 def search_positions_orales(query: str, top_k: int = ORALES_TOP_K) -> List[Dict]:
@@ -2437,55 +2417,6 @@ def search_positions_orales(query: str, top_k: int = ORALES_TOP_K) -> List[Dict]
     return [dict(h.payload or {}, _score=getattr(h, "score", None)) for h in hits]
 
 
-def format_positions_orales(points: List[Dict], car_max: int = ORALES_CAR_MAX) -> str:
-    """Le bloc POSITIONS EXPRIMÉES EN SÉANCE.
-
-    ⚠️ L'ORATEUR EST NOMMÉ, JAMAIS LE MINISTÈRE. `concordance_ministere` vaut
-    `diverge` sur 94 des 351 points (26,8 %) : sur plus d'un quart des entrées,
-    le ministre présent n'appartient pas au ministère attributaire. Une position
-    attribuée à une personne est toujours vraie ; attribuée à un ministère, elle
-    est fausse une fois sur quatre. Les entrées divergentes portent en plus une
-    mention explicite, pour que le modèle ne les généralise pas.
-    """
-    if not points:
-        return ""
-    blocs = []
-    for p in points:
-        date = str(p.get("date_reponse") or "")[:10]
-        chambre = p.get("chambre") or ""
-        type_q = p.get("type_question") or ""
-        entete = " · ".join(x for x in (date, chambre, type_q) if x)
-        orateur = (p.get("ministre_nom") or "orateur non identifié").strip()
-        # `reponse` = le tour de parole du ministre, isolé. PAS `verbatim_seance`,
-        # qui est le transcript brut de la séance : du HTML sur 351/351, médiane
-        # 5 345 caractères, et il contient les tours de parole des autres.
-        texte = _BALISE_ORALE.sub(" ", p.get("reponse") or "")
-        texte = re.sub(r"\s+", " ", _html.unescape(texte)).strip()
-        if len(texte) > car_max:
-            # En TOKENS — voir la note sur `ORALES_TOK_MAX`.
-            texte = truncate_text(texte, max_tokens=car_max // 4)
-        ligne = [f"[{entete}] {orateur}", f"« {texte} »"]
-        if (p.get("concordance_ministere") or "") == "diverge":
-            ligne.append("⚠️ réponse portée par un autre ministère que "
-                         "l'attributaire : la position engage l'orateur, "
-                         "pas le ministère saisi.")
-        if p.get("url_source"):
-            ligne.append(f"source : {p['url_source']}")
-        blocs.append("\n".join(ligne))
-    # ⚠️ CONTRAT D'ORDRE, ajouté le 12/09 à la demande de `feat/fiches`.
-    # Les entrées sont rendues DANS L'ORDRE OÙ ELLES ARRIVENT, sans tri ici. Ce
-    # n'est pas un détail d'implémentation : `_reduire_bloc` retire les entrées
-    # EN PARTANT DE LA QUEUE, donc **l'ordre reçu EST l'ordre de survie** — ce
-    # qu'on met en dernier est ce qu'on accepte de perdre en cas de saturation.
-    # Le producteur décide donc de ce qui survit, et il doit le savoir.
-    # C'était vrai par construction ; c'est désormais un contrat testé, parce
-    # qu'une propriété vraie par accident se casse sans qu'on la voie.
-    # Séparateur = LIGNE VIDE, et ce n'est pas cosmétique : `_reduire_bloc`
-    # découpe sur "\n\n" pour retirer des entrées ENTIÈRES. Avec un séparateur
-    # à lui, le bloc aurait été insécable — compté dans la fenêtre, jamais
-    # allégeable, et c'est « TEXTES JURIDIQUES » (dernier sacrifié, donc le
-    # plus protégé) qui aurait payé sa place.
-    return "\n\n".join(blocs)
 
 
 # Fonction de recherches d'anciennes questions / réponses dans le RAG Qdrant
@@ -2548,34 +2479,10 @@ def search_question_parlementaire(query: str, top_k: int = 5) -> List[ResponseDo
 # de récence à décroissance exponentielle (demi-vie ci-dessous).
 RECENCY_HALF_LIFE_YEARS = 4.0
 
-# Législature en cours : sert à distinguer une QE antérieure « du même dossier »
-# (trame factuelle recoupable) d'une QE d'une mandature révolue (registre seul).
-LEGISLATURE_COURANTE = "17"
-_PROX_TRAME_MIN = 0.85          # proximité cosinus au-dessus de laquelle la trame est admissible
-_TRAME_AGE_MAX_ANNEES = 2.0     # et réponse de moins de 2 ans
 
 
-def _legislature_de(doc) -> Optional[str]:
-    leg = getattr(doc, "legislature", None)
-    if leg:
-        return str(leg).strip()
-    m = re.search(r"L(\d{1,2})", getattr(doc, "uid", "") or "")
-    return m.group(1) if m else None
 
 
-def annoter_qe_contexte(doc, now: Optional[datetime] = None) -> str:
-    """En-tête d'un bloc de contexte parlementaire : proximité + statut trame/registre (F1)."""
-    now = now or datetime.now()
-    score = getattr(doc, "score", None)
-    d = safe_parse_date(getattr(doc, "date_reponse", None))
-    age = None if d == datetime.min else max(0.0, (now - d).days / 365.25)
-    meme_leg = _legislature_de(doc) == LEGISLATURE_COURANTE
-    recente = age is not None and age <= _TRAME_AGE_MAX_ANNEES
-    admissible = (score or 0) >= _PROX_TRAME_MIN and meme_leg and recente
-    statut = "TRAME FACTUELLE ADMISSIBLE" if admissible else "registre seulement"
-    prox = f"proximité {score:.2f}" if isinstance(score, (int, float)) else "proximité n. d."
-    return (f"[{prox} · {statut}] (source: {getattr(doc, 'uid', '?')}, "
-            f"réponse du {getattr(doc, 'date_reponse', None) or 'date inconnue'})")
 
 
 # --- Recherche internet : bloc daté / sourcé + repérage des textes publiés (F1) ---
@@ -2969,85 +2876,14 @@ def extract_order(label: str) -> int:
         return int(m_num.group(1))
     return float("inf")
 
-# --- F7 : situer chaque article dans son code pour borner sa portée ---
-# Avant : « Article L4321-14: <titre> » + contenu. Le modèle prenait l'article de
-# tête comme pertinent par construction et lui prêtait une portée générale
-# (« obligations déontologiques des professionnels de santé » pour un article du
-# chapitre des masseurs-kinésithérapeutes, #8922 ; « logements ET ERP » pour un
-# article sur les locaux d'habitation, #2891). On injecte maintenant le code et
-# la position (livre / titre / chapitre / section) avant le contenu.
-_NOMS_CODES = {
-    "CASF": "code de l'action sociale et des familles",
-    "Code_de_la_santé_publique": "code de la santé publique",
-    "Code_de_la_sécurité_sociale": "code de la sécurité sociale",
-    "Code_du_travail": "code du travail",
-}
 
 
-def _position_dans_le_code(contexte_hierarchique: str, niveaux: int = 3, max_len: int = 90) -> str:
-    """Derniers niveaux de la hiérarchie (hors « Partie … »), abrégés."""
-    parts = [p.strip() for p in (contexte_hierarchique or "").split(">") if p.strip()]
-    parts = [p for p in parts if not p.lower().startswith("partie")]
-    parts = parts[-niveaux:]
-    return " > ".join(p if len(p) <= max_len else p[:max_len - 1].rstrip() + "…" for p in parts)
 
 
-def _situation_article(art: dict) -> tuple:
-    """(code lisible, position dans le code) — l'identité de place d'un article."""
-    code_brut = art.get("collection") or art.get("code") or ""
-    code = _NOMS_CODES.get(code_brut, code_brut).strip()
-    code = code.lower() if code.lower().startswith("code") else code
-    return code, _position_dans_le_code(art.get("contexte_hierarchique", ""))
 
 
-def formater_article_pour_prompt(art: dict, max_tokens: int,
-                                 situation_precedente: Optional[tuple] = None) -> str:
-    """Bloc d'un article dans TEXTES JURIDIQUES APPLICABLES :
-
-        Article L4321-14 — code de la santé publique (Livre III : … > Chapitre Ier : Masseurs-kinésithérapeutes)
-        <titre>
-        <contenu tronqué>
-
-    `situation_precedente` : (code, position) de l'article qui PRÉCÈDE dans le
-    bloc. Quand elle est identique, la position n'est pas réimprimée — l'article
-    reste situé dans son code (F7), mais la chaîne hiérarchique n'est plus
-    répétée. L'enrichissement ramenant tout un chapitre, la même position était
-    réécrite jusqu'à 25 fois dans un seul prompt : 15,3 % du bloc juridique,
-    ≈ 673 tokens par question, pour zéro information ajoutée.
-    """
-    if art.get("provenance") == "cited_absent":
-        # La mention porte deja son propre libelle complet : lui ajouter
-        # l'en-tete « Article X — » le repeterait, et la troncature au budget
-        # pourrait couper la phrase qui dit justement de ne rien citer.
-        return (art.get("contenu") or "").strip()
-    code, position = _situation_article(art)
-    situation = code
-    if position:
-        meme = situation_precedente == (code, position)
-        suffixe = "même chapitre que ci-dessus" if meme else position
-        situation = f"{situation} ({suffixe})" if situation else f"({suffixe})"
-    entete = f"Article {art.get('num', 'N/A')}" + (f" — {situation}" if situation else "")
-    titre = (art.get("titre") or "").strip()
-    contenu = truncate_text(art.get("contenu", "") or "", max_tokens=max_tokens)
-    return "\n".join(p for p in (entete, titre, contenu) if p)
 
 
-def formater_articles_pour_prompt(articles: List[dict], budget_tokens: int) -> str:
-    """Le bloc juridique entier, sans répéter la position d'un même chapitre.
-
-    Le dégroupage se fait sur l'article PRÉCÉDENT, pas sur l'ensemble déjà vu :
-    l'ordre de `sort_articles_for_prompt` (cités, puis initiaux par score, puis
-    enrichis par numéro) rassemble les articles d'un même chapitre, et un renvoi
-    à « ci-dessus » ne doit jamais désigner un article éloigné.
-    """
-    if not articles:
-        return ""
-    par_article = max(1, budget_tokens // len(articles))
-    blocs, precedente = [], None
-    for art in articles:
-        blocs.append(formater_article_pour_prompt(art, par_article, precedente))
-        precedente = _situation_article(art)
-    return "\n\n".join(blocs)
 
 
 # Fonction qui tri les articles pour que la limite de tokens des prompts s'applique intelligemment
