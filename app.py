@@ -696,8 +696,13 @@ def search_tavily_government(subject: str, min_score: float = 0.5):
         if ds:
             try:
                 pub = datetime.fromisoformat(ds.replace("Z", ""))
-                # ✅ Condition supplémentaire : année 2025
-                if pub.year == 2025 or pub >= cutoff:
+                # La clause « ou pub.year == 2025 » a été retirée le 23/09/2026
+                # (déploiement autorisé par l'utilisateur). Écrite quand 2025 était
+                # l'année courante, elle laissait passer, en septembre 2026, tout
+                # janvier 2025 — vingt mois — comme une actualité récente. Elle
+                # rendait aussi les deux moteurs incomparables : le chemin Google
+                # (plus bas) n'a jamais porté cette clause.
+                if pub >= cutoff:
                     recent.append(r)
                     continue
                 else:
