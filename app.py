@@ -49,6 +49,8 @@ from types import SimpleNamespace
 import qe_prompt  # noqa: E402
 from qe_prompt import (  # noqa: E402
     FENETRE_MODELE,
+    FENETRE_RECHERCHE_GOOGLE,
+    FENETRE_RECHERCHE_TAVILY,
     FICHIER_OUVERTURES,
     GESTES_TIRES,
     NOM_FICHIER_OUVERTURES,
@@ -676,7 +678,14 @@ def search_tavily_government(subject: str, min_score: float = 0.5):
         "query": f"dernières annonces gouvernement France {subject}",
         "max_results": 100,
         "include_answer": True,
-        "include_domains": allowed_domains
+        "include_domains": allowed_domains,
+        # Fenetre demandee A TAVILY (voir qe_prompt). `include_published_date`
+        # rend la date par resultat -- c'est elle qui rend applicable le seuil
+        # d'anciennete arbitre le 19/09. On n'active PAS
+        # `filter_by_published_date` : un resultat sans date se signale, il ne
+        # se jette pas.
+        "time_range": FENETRE_RECHERCHE_TAVILY,
+        "include_published_date": True,
     }
 
     response = requests.post(url, json=payload, headers=headers)
@@ -766,7 +775,10 @@ def search_google_government(subject: str,
         "q": f"dernières annonces gouvernement France {subject}",
         "key": GOOGLE_API_KEY,
         "cx": GOOGLE_CX,
-        "num": max_results
+        "num": max_results,
+        # Fenetre demandee A GOOGLE (voir qe_prompt) : le filtre au retour,
+        # plus bas, ne peut rien trier puisque aucun resultat ne porte de date.
+        "dateRestrict": FENETRE_RECHERCHE_GOOGLE,
     }
 
     response = requests.get(url, params=params, timeout=20)
