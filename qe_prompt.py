@@ -143,6 +143,26 @@ FENETRE_MODELE = {"large": 32000, "autre": 16000}
 # ⚠️ Décision de l'utilisateur : ce test sera REFAIT dans quelques
 # semaines, quand l'outil aura évolué. La valeur vaut pour l'état
 # actuel, pas pour toujours.
+# Fenetre de fraicheur demandee AUX MOTEURS, a la requete -- et non appliquee
+# au retour. Verifie a la source le 23/09/2026 : Google Custom Search accepte
+# `dateRestrict` (d/w/m/y + nombre), Tavily accepte `time_range`
+# (day/week/month/year). Les deux disent la MEME fenetre, ecrite ici une fois.
+#
+# Pourquoi au depart plutot qu'a l'arrivee : filtrer au retour gaspille les dix
+# resultats demandes -- si les dix plus pertinents sont vieux, on n'en garde
+# aucun. Et surtout, mesure du 23/09 : sur 70 resultats Google retenus, AUCUN ne
+# portait de date exploitable. Un filtre a l'arrivee ne peut donc rien trier ; le
+# moteur, lui, connait les dates de son index meme quand il ne nous les montre pas.
+#
+# Le filtre au retour est CONSERVE comme filet : un moteur peut ignorer la
+# consigne, et un resultat date d'avant la fenetre doit encore tomber.
+# On ne demande PAS a Tavily d'ecarter les resultats SANS date
+# (`filter_by_published_date`) : l'utilisateur a arbitre le 19/09 qu'une date
+# inconnue se signale et se demande au redacteur, elle ne se jette pas.
+FENETRE_RECHERCHE_JOURS = 365
+FENETRE_RECHERCHE_GOOGLE = "y1"       # dateRestrict
+FENETRE_RECHERCHE_TAVILY = "year"     # time_range
+
 TOKEN_LIMITS = {
     "large": {
         "question": 1500,
